@@ -18,10 +18,10 @@
     status and actionable guidance so the report remains a complete, traceable mirror of
     the checklist rather than a partial one.
 
-    Checklist sections:
+    Checklist sections (the Linux "Components - VSA Build" section 3 is intentionally
+    omitted - this script audits Veeam Backup & Replication on Windows Server):
         1  Components
         2  Components - Windows Build
-        3  Components - VSA Build            (Linux appliance - verify on the VSA)
         4  Repositories
         5  Accounts and Permissions
         6  Encryption
@@ -97,6 +97,38 @@ $script:_mw = $null; $script:_mwLoaded = $false          # malware detection opt
 $script:_admins = $null; $script:_adminsLoaded = $false  # local Administrators members
 $script:_secpol = $null                    # secedit [System Access] export
 
+# --- Compliance level per checklist item (from the VDP v13 Cyber Secure Checklist) ----
+# Shown verbatim in the report so each row carries its "Required" / "Advised if
+# applicable" classification exactly as in the source worksheet.
+$script:ComplianceMap = @{
+    '1.1'='Required'; '1.2'='Required'; '1.3'='Required'; '1.4'='Required'; '1.5'='Required'; '1.6'='Required'
+    '1.7'='Advised if applicable'; '1.8'='Required'; '1.9'='Required'; '1.10'='Required'; '1.11'='Advised if applicable'; '1.12'='Required'
+    '1.13'='Required'; '1.14'='Advised if applicable'; '1.15'='Advised if applicable'; '1.16'='Required'; '1.17'='Required'; '1.18'='Required'
+    '1.19'='Required'; '1.20'='Advised if applicable'; '1.21'='Advised if applicable'; '1.22'='Required'; '1.23'='Required'; '1.24'='Advised if applicable'
+    '2.1'='Advised if applicable'; '2.2'='Advised if applicable'; '2.3'='Required'; '2.4'='Required'; '2.5'='Advised if applicable'; '2.6'='Advised if applicable'
+    '2.7'='Advised if applicable'; '2.8'='Required'; '2.9'='Required'; '2.10'='Advised if applicable'; '2.11'='Advised if applicable'
+    '4.1'='Required'; '4.2'='Required'; '4.3'='Required'; '4.4'='Required'
+    '4.5'='Advised if applicable'; '4.6'='Advised if applicable'; '4.7'='Advised if applicable'; '4.8'='Advised if applicable'; '4.9'='Required'; '4.10'='Required'
+    '4.11'='Required'; '4.12'='Advised if applicable'; '4.13'='Required'; '4.14'='Required'; '4.15'='Required'; '4.16'='Required'
+    '4.17'='Advised if applicable'; '4.18'='Required'; '5.1'='Advised if applicable'; '5.2'='Required'; '5.3'='Required'; '5.4'='Required'
+    '5.5'='Advised if applicable'; '5.6'='Required'; '5.7'='Advised if applicable'; '5.8'='Advised if applicable'; '5.9'='Required'; '5.10'='Required'
+    '5.11'='Advised if applicable'; '5.12'='Advised if applicable'; '5.13'='Advised if applicable'; '5.14'='Required'; '5.15'='Required'; '5.16'='Advised if applicable'
+    '5.17'='Required'; '5.18'='Required'; '5.19'='Required'; '5.20'='Required'; '5.21'='Required'; '5.22'='Advised if applicable'
+    '5.23'='Required'; '5.24'='Required'; '5.25'='Required'; '5.26'='Advised if applicable'; '5.27'='Advised if applicable'; '5.28'='Advised if applicable'
+    '5.29'='Advised if applicable'; '5.30'='Advised if applicable'; '5.31'='Required'; '5.32'='Required'; '5.33'='Required'; '5.34'='Advised if applicable'
+    '5.35'='Advised if applicable'; '6.1'='Required'; '6.2'='Required'; '6.3'='Required'; '6.4'='Advised if applicable'; '6.5'='Required'
+    '6.6'='Required'; '6.7'='Advised if applicable'; '6.8'='Advised if applicable'; '6.9'='Required'; '6.10'='Required'; '6.11'='Advised if applicable'
+    '6.12'='Required'; '7.1'='Required'; '7.2'='Advised if applicable'; '7.3'='Advised if applicable'; '7.4'='Advised if applicable'; '7.5'='Advised if applicable'
+    '7.6'='Required'; '8.1'='Advised if applicable'; '8.2'='Required'; '8.3'='Required'; '8.4'='Required'; '8.5'='Required'
+    '8.6'='Advised if applicable'; '8.7'='Required'; '8.8'='Required'; '8.9'='Required'; '8.10'='Advised if applicable'; '8.11'='Required'
+    '8.12'='Required'; '8.13'='Advised if applicable'; '8.14'='Advised if applicable'; '9.1'='Advised if applicable'; '9.2'='Required'; '9.3'='Advised if applicable'
+    '9.4'='Advised if applicable'; '9.5'='Advised if applicable'; '9.6'='Required'; '9.7'='Required'; '9.8'='Advised if applicable'; '9.9'='Advised if applicable'
+    '9.10'='Advised if applicable'; '9.11'='Required'; '9.12'='Advised if applicable'; '10.1'='Required'; '10.2'='Required'; '10.3'='Required'
+    '10.4'='Required'; '10.5'='Advised if applicable'; '10.6'='Required'; '10.7'='Required'; '10.8'='Required'; '10.9'='Advised if applicable'
+    '10.10'='Advised if applicable'; '10.11'='Advised if applicable'; '10.12'='Advised if applicable'; '10.13'='Advised if applicable'; '10.14'='Required'; '10.15'='Required'
+    '10.16'='Advised if applicable'; '10.17'='Advised if applicable'
+}
+
 <#
     Add-AuditResult - the single PSCustomObject factory + color-coded console writer.
     Shape (per requirement, now carrying the checklist number + exact name):
@@ -110,10 +142,12 @@ function Add-AuditResult {
         [Parameter(Mandatory)][string]$RuleName,
         [Parameter(Mandatory)][ValidateSet('Passed', 'Failed', 'Warning', 'Error', 'Manual', 'Info')][string]$Status,
         [Parameter()][string]$CurrentValue = 'N/A',
-        [Parameter()][string]$Recommendation = ''
+        [Parameter()][string]$Recommendation = '',
+        [Parameter()][string]$Compliance = ''
     )
     $result = [PSCustomObject]@{
         'Item #'         = $ItemNumber
+        Compliance       = $Compliance
         Topic            = $Topic
         'Rule Name'      = $RuleName
         Status           = $Status
@@ -131,6 +165,7 @@ function Add-AuditResult {
         default   { 'Cyan' }
     }
     Write-Host ('  {0,-6} [{1,-7}] ' -f $ItemNumber, $Status) -ForegroundColor $color -NoNewline
+    if ($Compliance) { Write-Host ('({0}) ' -f $Compliance) -ForegroundColor DarkGray -NoNewline }
     Write-Host $RuleName -ForegroundColor Gray
     if ($CurrentValue -and $CurrentValue -ne 'N/A') {
         Write-Host ('              -> {0}' -f $CurrentValue) -ForegroundColor DarkGray
@@ -154,10 +189,11 @@ function Invoke-Item {
         [string]$Recommendation = 'Verify manually against the VDP v13 Cyber Secure Checklist.',
         [scriptblock]$Check
     )
+    $comp = if ($script:ComplianceMap.ContainsKey($Num)) { $script:ComplianceMap[$Num] } else { '' }
     if (-not $Check) {
         if ($IncludeManual) {
             Add-AuditResult -ItemNumber $Num -Topic $Topic -RuleName $Name -Status 'Manual' `
-                -CurrentValue 'Not script-verifiable' -Recommendation $Recommendation
+                -CurrentValue 'Not script-verifiable' -Recommendation $Recommendation -Compliance $comp
         }
         return
     }
@@ -167,11 +203,11 @@ function Invoke-Item {
         if ($r -isnot [hashtable]) { throw 'Check did not return a hashtable.' }
         $val = if ($r.ContainsKey('Value') -and $r.Value) { [string]$r.Value } else { 'N/A' }
         $rec = if ($r.ContainsKey('Recommendation') -and $r.Recommendation) { $r.Recommendation } else { $Recommendation }
-        Add-AuditResult -ItemNumber $Num -Topic $Topic -RuleName $Name -Status $r.Status -CurrentValue $val -Recommendation $rec
+        Add-AuditResult -ItemNumber $Num -Topic $Topic -RuleName $Name -Status $r.Status -CurrentValue $val -Recommendation $rec -Compliance $comp
     }
     catch {
         Add-AuditResult -ItemNumber $Num -Topic $Topic -RuleName $Name -Status 'Error' `
-            -CurrentValue $_.Exception.Message -Recommendation $Recommendation
+            -CurrentValue $_.Exception.Message -Recommendation $Recommendation -Compliance $comp
     }
 }
 
@@ -457,7 +493,11 @@ function Invoke-ComponentChecks {
             $cfg = & $c -ErrorAction Stop
             $enc = Get-PropSafe -InputObject (Get-PropSafe -InputObject $cfg -Name @('EncryptionOptions')) -Name @('Enabled', 'IsEnabled')
             if ($null -eq $enc) { $enc = Get-PropSafe -InputObject $cfg -Name @('EncryptionEnabled') }
-            @{ Status = $(if ($enc -eq $true) { 'Passed' } elseif ($null -eq $enc) { 'Warning' } else { 'Failed' }); Value = ("Config backup encryption={0}" -f (nv $enc)) }
+            # True  = configuration database backup encryption ENABLED  -> Passed
+            # False = configuration database backup encryption DISABLED -> Failed
+            if ($enc -eq $true)  { return @{ Status = 'Passed'; Value = 'Config backup encryption=True (enabled)' } }
+            if ($enc -eq $false) { return @{ Status = 'Failed'; Value = 'Config backup encryption=False (disabled)' } }
+            @{ Status = 'Warning'; Value = 'Config backup encryption could not be determined' }
         }
 
     # 1.10 Physically secured - manual.
@@ -471,7 +511,9 @@ function Invoke-ComponentChecks {
             if (Get-Command Get-Tpm -ErrorAction SilentlyContinue) { try { $tpm = (Get-Tpm).TpmPresent } catch { } }
             $sb = 'unknown'
             try { $sb = [string](Confirm-SecureBootUEFI) } catch { $sb = 'legacy BIOS / not supported' }
-            $st = if ($tpm -eq $true -and $sb -eq 'True') { 'Passed' } else { 'Warning' }
+            # TpmPresent True  = hardware protected with TPM -> Passed
+            # TpmPresent False = NOT enabled with TPM        -> Failed
+            $st = if ($tpm -eq $true) { 'Passed' } elseif ($tpm -eq $false) { 'Failed' } else { 'Warning' }
             @{ Status = $st; Value = ("TPM present={0}; SecureBoot={1}" -f (nv $tpm), $sb) }
         }
 
@@ -518,30 +560,60 @@ function Invoke-ComponentChecks {
             @{ Status = $st; Value = ("SMB1={0}; SSL2.0\Server\Enabled={1}" -f (nv $smb1), (nv $ssl2)) }
         }
 
-    # 1.19 OS session timeout / re-authentication (machine inactivity limit).
+    # 1.19 OS session timeout / re-authentication.
+    # "Interactive logon: Machine inactivity limit" writes InactivityTimeoutSecs under the
+    # System policy key. Compliant = configured and <= 600 seconds (locks + requires
+    # re-authentication). Ref: learn.microsoft.com .../interactive-logon-machine-inactivity-limit
     Invoke-Item -Num '1.19' -Topic $T -Name 'Are OS session timeouts and re-authentication configured for Veeam?' `
-        -Recommendation 'Set an interactive-logon machine inactivity limit (e.g. <=600s) requiring re-authentication.' -Check {
+        -Recommendation 'Set "Interactive logon: Machine inactivity limit" (InactivityTimeoutSecs) to <=600 seconds so the session locks and re-authentication is required.' -Check {
             $t = Get-RegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'InactivityTimeoutSecs'
-            $st = if ($t -gt 0 -and $t -le 900) { 'Passed' } elseif ($t -gt 0) { 'Warning' } else { 'Failed' }
-            @{ Status = $st; Value = ("InactivityTimeoutSecs={0}" -f (nv $t)) }
+            if ($null -eq $t -or $t -eq 0) { return @{ Status = 'Failed'; Value = 'InactivityTimeoutSecs not set / 0 (no inactivity limit)' } }
+            if ($t -le 600) { return @{ Status = 'Passed'; Value = ("InactivityTimeoutSecs={0}s (<=600s)" -f $t) } }
+            @{ Status = 'Failed'; Value = ("InactivityTimeoutSecs={0}s (>600s - exceeds limit)" -f $t) }
         }
 
-    # 1.20 Anonymized naming (heuristic on hostname).
+    # 1.20 Anonymized naming - enumerate ALL Veeam infrastructure components and flag any
+    # whose name reveals its role (managed servers, proxies, repositories + the local VBR).
     Invoke-Item -Num '1.20' -Topic $T -Name "Are Veeam components 'anonymized' within the infrastructure? E.g. using a non-obvious naming convention" `
-        -Recommendation "Avoid obvious names like 'BackupSrv1', 'Veeam', 'Repo1'." -Check {
-            $n = $env:COMPUTERNAME
-            if ($n -match '(?i)veeam|backup|repo|vbr|veeam') { @{ Status = 'Warning'; Value = ("Hostname '{0}' reveals its role" -f $n) } }
-            else { @{ Status = 'Passed'; Value = ("Hostname '{0}' is non-obvious" -f $n) } }
+        -Recommendation "Avoid obvious names like 'BackupSrv1', 'Veeam', 'Repo1', 'Proxy1' across all Veeam components." -Check {
+            $obvious = '(?i)veeam|backup|\bvbr\b|repo|proxy|vbo|mount|gateway|wan|tape|archive|immut'
+            $components = New-Object System.Collections.Generic.List[string]
+            # Local VBR host.
+            $components.Add(("VBR host: {0}" -f $env:COMPUTERNAME))
+            if ($script:VbrConnected) {
+                # Managed servers (Get-VBRServer), backup proxies, and repositories.
+                try { foreach ($s in @(Get-VBRServer -ErrorAction SilentlyContinue)) { $components.Add(("Server: {0}" -f (Get-PropSafe -InputObject $s -Name @('Name')))) } } catch { }
+                $pc = Test-VeeamCmdlet -Name @('Get-VBRBackupProxy', 'Get-VBRViProxy')
+                if ($pc) { try { foreach ($p in @(& $pc -ErrorAction SilentlyContinue)) { $components.Add(("Proxy: {0}" -f (Get-PropSafe -InputObject $p -Name @('Name')))) } } catch { } }
+                try { foreach ($r in @(Get-Repos)) { $components.Add(("Repository: {0}" -f (Get-PropSafe -InputObject $r -Name @('Name')))) } } catch { }
+            }
+            # Flag components whose displayed name matches an obvious pattern.
+            $flagged = @($components | Where-Object { ($_ -split ':\s',2)[-1] -match $obvious })
+            $st = if ($flagged.Count -eq 0) { 'Passed' } else { 'Warning' }
+            $v = "Components ({0}): {1}" -f $components.Count, ($components -join '; ')
+            if ($flagged.Count -gt 0) { $v += (" || Obvious names: {0}" -f ($flagged -join '; ')) }
+            @{ Status = $st; Value = $v }
         }
 
-    # 1.21 Syslog / SIEM integration (SDK probe).
+    # 1.21 Syslog / SIEM integration.
+    #   No syslog server configured        -> Failed
+    #   One or more configured             -> Warning (list the target; SIEM needs manual confirmation)
     Invoke-Item -Num '1.21' -Topic $T -Name 'Is Veeam configured to send log data to a syslog server for SIEM integration?' `
         -Recommendation 'Configure a syslog server for SIEM integration.' -Check {
             if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
             $c = Test-VeeamCmdlet -Name @('Get-VBRSyslogServer', 'Get-VBRSyslogServerInfo')
             if (-not $c) { return @{ Status = 'Warning'; Value = 'Syslog cmdlet unavailable - verify in console' } }
             $s = @(& $c -ErrorAction Stop)
-            @{ Status = $(if ($s.Count -gt 0) { 'Passed' } else { 'Failed' }); Value = ("{0} syslog server(s) configured" -f $s.Count) }
+            if ($s.Count -eq 0) { return @{ Status = 'Failed'; Value = 'No syslog server configured' } }
+            # Show what has been configured (host:port) for each syslog target.
+            $targets = $s | ForEach-Object {
+                $h = Get-PropSafe -InputObject $_ -Name @('ServerHost', 'Host', 'Address', 'Name', 'ServerName')
+                $p = Get-PropSafe -InputObject $_ -Name @('Port', 'ServerPort')
+                if ($p) { "$h`:$p" } else { "$h" }
+            }
+            @{ Status  = 'Warning'
+               Value   = ("{0} syslog server(s) configured: {1}" -f $s.Count, ($targets -join ', '))
+               Recommendation = 'Further manual check to confirm if it is SIEM server.' }
         }
 
     # 1.22 PKI-based authentication - manual.
@@ -598,7 +670,10 @@ function Invoke-WindowsBuildChecks {
     Invoke-Item -Num '2.2' -Topic $T -Name 'Are you using guest interaction proxy instead of VBR server for application awareness ?' `
         -Recommendation 'Use dedicated guest interaction proxies rather than the VBR server for guest processing.'
 
-    # 2.3 Config DB backup stored separately (SDK target vs local).
+    # 2.3 Config DB backup stored separately from the VBR server.
+    #   Target repository resides on a DIFFERENT host than the VBR server -> Passed
+    #   Target repository resides ON the VBR host                          -> Failed
+    #   Host could not be resolved                                         -> Warning
     Invoke-Item -Num '2.3' -Topic $T -Name 'Is the Veeam configuration database backup stored separately from the VBR server (non-appliance)?' `
         -Recommendation 'Target the configuration backup at a repository that is not local to the VBR server.' -Check {
             if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
@@ -606,15 +681,28 @@ function Invoke-WindowsBuildChecks {
             if (-not $c) { return @{ Status = 'Warning'; Value = 'Config backup cmdlet unavailable' } }
             $cfg = & $c -ErrorAction Stop
             $target = Get-PropSafe -InputObject $cfg -Name @('Target', 'RepositoryName', 'Repository')
-            @{ Status = 'Warning'; Value = ("Config backup target: {0} - confirm it is off the VBR host" -f (nv $target)) }
+            # Resolve the host of the target repository.
+            $repo = @(Get-Repos | Where-Object { (Get-PropSafe -InputObject $_ -Name @('Name')) -eq $target }) | Select-Object -First 1
+            $hostName = ''
+            if ($repo) {
+                $h = Get-PropSafe -InputObject $repo -Name @('Host')
+                if ($h) { $hostName = [string](Get-PropSafe -InputObject $h -Name @('Name')) }
+                if (-not $hostName) { $hostName = [string](Get-PropSafe -InputObject $repo -Name @('HostName', 'ServerName')) }
+            }
+            $localNames = @($env:COMPUTERNAME, "$env:COMPUTERNAME.$env:USERDNSDOMAIN", 'localhost', '127.0.0.1', 'this server')
+            if (-not $hostName) { return @{ Status = 'Warning'; Value = ("Config backup target '{0}' - host could not be resolved; confirm it is off the VBR host" -f (nv $target)) } }
+            $isLocal = $localNames | Where-Object { $_ -and $hostName -like "$_*" -or $hostName -eq $_ }
+            if ($isLocal) { @{ Status = 'Failed'; Value = ("Config backup target '{0}' is ON the VBR host ({1})" -f $target, $hostName) } }
+            else { @{ Status = 'Passed'; Value = ("Config backup target '{0}' is OFF the VBR host (on {1})" -f $target, $hostName) } }
         }
 
     # 2.4 - 2.11 registry / service hardening.
     Invoke-Item -Num '2.4' -Topic $T -Name 'Remote Registry service (RemoteRegistry) should be disabled' `
         -Recommendation 'Disable the Remote Registry service.' -Check { Test-SvcDisabled -Name 'RemoteRegistry' -Severity 'Failed' }
 
+    # 2.5: StartMode Disabled -> Passed; anything else (e.g. Auto) -> Failed.
     Invoke-Item -Num '2.5' -Topic $T -Name 'Windows Remote Management (WinRM) service should be disabled' `
-        -Recommendation 'Disable WinRM unless explicitly required.' -Check { Test-SvcDisabled -Name 'WinRM' -Severity 'Warning' }
+        -Recommendation 'Disable WinRM (StartMode=Disabled) unless explicitly required.' -Check { Test-SvcDisabled -Name 'WinRM' -Severity 'Failed' }
 
     Invoke-Item -Num '2.6' -Topic $T -Name 'WDigest credentials caching should be disabled' `
         -Recommendation 'Set WDigest\UseLogonCredential=0 to prevent plaintext credential caching.' -Check {
@@ -650,29 +738,6 @@ function Invoke-WindowsBuildChecks {
             $l = Get-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'EnableMulticast'
             @{ Status = $(if ($l -eq 0) { 'Passed' } else { 'Warning' }); Value = ("EnableMulticast={0}" -f $(if ($null -eq $l) { 'not set (LLMNR enabled)' } else { $l })) }
         }
-}
-
-#endregion
-
-#region ----------------------------------------------------------------------- 3. VSA Build (Linux appliance)
-
-function Invoke-VsaBuildChecks {
-    Write-Host "`n--- 3. Components - VSA Build (Linux appliance) ---" -ForegroundColor White
-    $T = 'Components - VSA Build'
-    # The Veeam Software Appliance is a hardened Linux (JeOS) appliance; these items cannot
-    # be verified from a Windows PowerShell host. They are surfaced as Manual with guidance.
-    $vsa = @(
-        @('3.1', 'Are you using Veeam Integrated Appliance (VIA) for infrastructure components?', 'Verify appliance deployment model (hmc.html).'),
-        @('3.2', 'Are you using Veeam Software Appliance (VSA) with pre-hardened Linux JeOS configuration following DISA STIG standards?', 'Verify DISA STIG-hardened JeOS deployment on the VSA.'),
-        @('3.3', 'Is the VSA configured with services running under low-privilege accounts (non-root)?', 'Verify VSA services run under non-root accounts.'),
-        @('3.4', 'Are VSA automatic security updates enabled for continuous patch management?', 'Enable VSA automatic security updates (em_update_linux.html).'),
-        @('3.5', 'Is Lockdown Mode enabled on VSA to prevent unauthorized software installation?', 'Enable Lockdown Mode on the VSA.'),
-        @('3.6', 'Is SSH access disabled on VSA in production environments?', 'Disable SSH on the VSA in production.'),
-        @('3.7', 'Is high availability clustering configured for backup infrastructure resilience?', 'Configure HA clustering where licensed.'),
-        @('3.8', 'Are Linux hosts and repositories manually verified for authentication?', 'Manually verify Linux host/repository authentication.'),
-        @('3.9', 'Is SSH protected with 2FA/MFA or disabled post-deployment?', 'Protect SSH with MFA or disable it post-deployment.')
-    )
-    foreach ($i in $vsa) { Invoke-Item -Num $i[0] -Topic $T -Name $i[1] -Recommendation ("VSA/Linux appliance item - " + $i[2]) }
 }
 
 #endregion
@@ -1227,6 +1292,7 @@ function Export-ComplianceReport {
  th{background:#334e68;color:#fff;text-align:left;padding:8px 10px;font-size:13px;position:sticky;top:0;}
  td{padding:7px 10px;border-bottom:1px solid #e4e7eb;font-size:13px;vertical-align:top;}
  tr:nth-child(even){background:#f8fafc;} td.num{white-space:nowrap;font-weight:bold;color:#334e68;}
+ td.req{color:#c0392b;font-weight:bold;white-space:nowrap;} td.adv{color:#627d98;white-space:nowrap;}
  .s-Passed{color:#2e8b57;font-weight:bold;}.s-Failed{color:#c0392b;font-weight:bold;}
  .s-Warning{color:#b9770e;font-weight:bold;}.s-Error{color:#8e44ad;font-weight:bold;}
  .s-Manual{color:#4a6572;font-weight:bold;}.s-Info{color:#0b5394;font-weight:bold;}
@@ -1234,10 +1300,12 @@ function Export-ComplianceReport {
 '@
             $rows = foreach ($r in $script:Results) {
                 $num = Convert-HtmlEncode $r.'Item #'
+                $cp  = Convert-HtmlEncode $r.Compliance
                 $rn  = Convert-HtmlEncode $r.'Rule Name'
                 $cv  = Convert-HtmlEncode $r.'Current Value'
                 $rc  = Convert-HtmlEncode $r.Recommendation
-                "<tr><td class='num'>$num</td><td>$($r.Topic)</td><td>$rn</td><td class='s-$($r.Status)'>$($r.Status)</td><td>$cv</td><td>$rc</td></tr>"
+                $cpCls = if ($r.Compliance -eq 'Required') { 'req' } else { 'adv' }
+                "<tr><td class='num'>$num</td><td class='$cpCls'>$cp</td><td>$($r.Topic)</td><td>$rn</td><td class='s-$($r.Status)'>$($r.Status)</td><td>$cv</td><td>$rc</td></tr>"
             }
 
             $html = @"
@@ -1254,7 +1322,7 @@ function Export-ComplianceReport {
  <div class="card c-man">Manual<b>$man</b></div>
 </div>
 <table>
-<thead><tr><th>Item #</th><th>Topic</th><th>Rule Name</th><th>Status</th><th>Current Value</th><th>Recommendation</th></tr></thead>
+<thead><tr><th>Item #</th><th>Compliance</th><th>Topic</th><th>Rule Name</th><th>Status</th><th>Current Value</th><th>Recommendation</th></tr></thead>
 <tbody>
 $($rows -join "`n")
 </tbody></table>
@@ -1275,7 +1343,6 @@ $($rows -join "`n")
 try {
     Invoke-ComponentChecks
     Invoke-WindowsBuildChecks
-    Invoke-VsaBuildChecks
     Invoke-RepositoryChecks
     Invoke-AccountChecks
     Invoke-EncryptionChecks

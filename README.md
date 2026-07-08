@@ -1,13 +1,15 @@
 # VBR v13 Cyber Secure Compliance Audit
 
 `Invoke-VbrCyberSecureAudit.ps1` audits a local (or remote) Veeam Backup & Replication
-v13 server on Windows Server against the **full Veeam Data Platform (VDP) v13 Cyber
-Secure Checklist** (all 158 numbered items, 1.1 – 10.17). Every item appears in the
-report tagged with its **checklist number and exact name**. Items a script can verify
-are checked automatically; inherently manual items (physical security, training, network
-topology, the Linux VSA appliance section, etc.) are reported with a `Manual` status and
-guidance, so the report is a complete mirror of the checklist. Output is a color-coded
-console summary plus an HTML/CSV compliance report.
+v13 server on Windows Server against the **Veeam Data Platform (VDP) v13 Cyber Secure
+Checklist** (149 items). The Linux **"Components - VSA Build" section (3.1–3.9) is
+intentionally excluded** — this script targets VBR on Windows Server. Every item appears
+in the report tagged with its **checklist number, exact name, and Compliance level**
+(`Required` / `Advised if applicable`, taken verbatim from the worksheet). Items a script
+can verify are checked automatically; inherently manual items (physical security,
+training, network topology, etc.) are reported with a `Manual` status and guidance, so
+the report is a complete mirror of the checklist. Output is a color-coded console summary
+plus an HTML/CSV compliance report.
 
 ## Requirements
 
@@ -53,25 +55,25 @@ established, so the OS/registry checks still complete.
 
 ## Output
 
-Each item is emitted as a `PSCustomObject` (the report shows the checklist number + name):
+Each item is emitted as a `PSCustomObject` (the report shows the checklist number, name
+and compliance level):
 
 ```
-Item # | Topic | Rule Name | Status | Current Value | Recommendation
+Item # | Compliance | Topic | Rule Name | Status | Current Value | Recommendation
 ```
 
 Status values: **Passed / Failed / Warning / Error / Manual**. Reports are written as
 `VBR_CyberSecure_Audit_<HOST>_<TIMESTAMP>.{html,csv}`. The HTML "Auto Score" =
 `Passed / (Passed+Failed+Warning+Error)`, excluding Manual items.
 
-## Checklist coverage (all 158 items, 1.1 – 10.17)
+## Checklist coverage (149 items; section 3 VSA Build excluded)
 
 Every numbered item is represented. Highlights of what is **automatically verified**:
 
 | Section                          | Automated checks                                                                                     |
 |----------------------------------|------------------------------------------------------------------------------------------------------|
 | **1 Components**                 | 1.1 NTLM, 1.2 patch recency + Veeam Updater, 1.3 LTS/LTSC build, 1.4 VBR build (KB2680), 1.5 sole-tenant roles, 1.6 domain separation, 1.8 firewall, 1.9 config-DB encryption, 1.11 TPM/Secure Boot, 1.16 console MFA, 1.18 SSL2/SMB1, 1.19 inactivity timeout, 1.20 naming, 1.21 syslog, 1.23 health check, 1.24 CDP |
-| **2 Components – Windows Build** | 2.1/2.8 Defender/AV, 2.4 RemoteRegistry, 2.5 WinRM, 2.6 WDigest, 2.7 WPAD, 2.9 RDP, 2.10 WSH, 2.11 LLMNR |
-| **3 Components – VSA Build**     | Linux appliance — reported **Manual** (verify on the VSA)                                             |
+| **2 Components – Windows Build** | 2.1/2.8 Defender/AV, 2.3 config-DB backup off-host, 2.4 RemoteRegistry, 2.5 WinRM (StartMode Disabled→Pass / Auto→Fail), 2.6 WDigest, 2.7 WPAD, 2.9 RDP, 2.10 WSH, 2.11 LLMNR |
 | **4 Repositories**               | 4.1 object-lock, 4.3 hardened, 4.4 immutable roll-up, 4.10 time services, 4.13 backup copies, 4.15 SOBR capacity tier, 4.18 Linux immutability |
 | **5 Accounts and Permissions**   | 5.2 MFA, 5.3/5.31 Security Officer / four-eyes, 5.8/5.32 RBAC roles, 5.9/5.20 local Administrators, 5.21 audit policy, 5.23 password policy, 5.24 lockout policy, 5.26 gMSA |
 | **6 Encryption**                 | 6.2 KMS, 6.4 SMB signing/encryption, 6.5 job encryption, 6.6 network encryption, 6.12 repo encryption |
