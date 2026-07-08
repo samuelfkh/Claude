@@ -1,0 +1,4 @@
+# Audit report outputs
+VBR_CyberSecure_Audit_*.csv
+VBR_CyberSecure_Audit_*.html
+VBR_Linux_Audit_*.csv
