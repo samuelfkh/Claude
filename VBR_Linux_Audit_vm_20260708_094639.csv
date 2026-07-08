@@ -1,0 +1,6 @@
+"Item #","Compliance","Topic","Rule Name","Status","Current Value","Recommendation"
+"5.14","Required","Accounts and Permissions","Do Linux/Unix Systems use SSH Private/Public Key with Passphrase credentials?","Warning","/etc/ssh/sshd_config not readable","Verify PubkeyAuthentication=yes and PasswordAuthentication=no; key passphrase must be confirmed manually."
+"5.15","Required","Accounts and Permissions","Does SSH use strong password enforcement where applicable? (min of 15 characters)","Warning","No minlen/PASS_MIN_LEN policy found","Set minlen>=15 in /etc/security/pwquality.conf (or PAM) to enforce strong passwords."
+"5.16","Advised if applicable","Accounts and Permissions","Is a dedicated, audited account used for repository access","Warning","Account 'root' exists; auditd=inactive","Enable and start auditd so repository-account activity is audited."
+"5.17","Required","Accounts and Permissions","Is the account for repository access NOT root, or a member of Sudoers","Failed","Account 'root' is root (uid=0)","Use a non-root account for repository access (KB2676)."
+"5.18","Required","Accounts and Permissions","Where required, is LINUX service account ""NOT"" root but leverages SUDOER, Firewall and PAM security?","Failed","account 'root' uid=0; Firewall=none; PAM=yes","Ensure the service account is non-root and that firewall + PAM protections are enabled."

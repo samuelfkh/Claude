@@ -862,15 +862,53 @@ function Invoke-AccountChecks {
     Write-Host "`n--- 5. Accounts and Permissions ---" -ForegroundColor White
     $T = 'Accounts and Permissions'
 
-    Invoke-Item -Num '5.1' -Topic $T -Name 'Is Single Sign-On (SSO) configured using SAML 2.0 or OAuth 2.0?' -Recommendation 'Configure SSO (SAML/OAuth) where applicable (VSPC/EM).'
-
-    Invoke-Item -Num '5.2' -Topic $T -Name 'Is Multi-Factor Authentication (MFA) mandatory for all user accounts accessing Veeam console?' `
-        -Recommendation 'Make MFA mandatory for all console users.' -Check {
+    # 5.1 SAML SSO - VBR Console > Users and Roles > Identity Provider > Enable SAML Authentication.
+    Invoke-Item -Num '5.1' -Topic $T -Name 'Is Single Sign-On (SSO) configured using SAML 2.0 or OAuth 2.0?' `
+        -Recommendation 'Enable SAML authentication under Users and Roles > Identity Provider.' -Check {
             if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name @('Get-VBRIdentityProvider', 'Get-VBRSamlSettings', 'Get-VBRIdentityProviderSettings')
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'Identity provider cmdlet unavailable - verify Users and Roles > Identity Provider' } }
+            $idp = @(& $c -ErrorAction Stop)
+            # SAML providers that are enabled.
+            $saml = @($idp | Where-Object {
+                ((Get-PropSafe -InputObject $_ -Name @('Type', 'ProviderType', 'Protocol')) -match 'SAML') -and
+                ((Get-PropSafe -InputObject $_ -Name @('IsEnabled', 'Enabled')) -eq $true)
+            })
+            if ($saml.Count -gt 0) {
+                @{ Status = 'Passed'; Value = ("SAML authentication enabled: {0}" -f (($saml | ForEach-Object { Get-PropSafe -InputObject $_ -Name @('Name', 'DisplayName') }) -join ', ')) }
+            }
+            elseif ($idp.Count -gt 0) { @{ Status = 'Failed'; Value = 'Identity provider(s) present but SAML authentication NOT enabled' } }
+            else { @{ Status = 'Failed'; Value = 'No SAML identity provider configured' } }
+        }
+
+    # 5.2 Per-user MFA - VBR Console > Users and Roles > (each account) > "Enable MFA".
+    # Enumerate every role assignment and confirm each account has the MFA flag set.
+    Invoke-Item -Num '5.2' -Topic $T -Name 'Is Multi-Factor Authentication (MFA) mandatory for all user accounts accessing Veeam console?' `
+        -Recommendation 'Enable MFA on every account under Users and Roles.' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $ac = Test-VeeamCmdlet -Name @('Get-VBRUserRoleAssignment', 'Get-VBRRbacRoleAssignment')
+            if ($ac) {
+                $a = @(& $ac -ErrorAction Stop)
+                if ($a.Count -gt 0) {
+                    $determined = $false; $noMfa = @()
+                    foreach ($u in $a) {
+                        $m = Get-PropSafe -InputObject $u -Name @('IsMfaEnabled', 'MfaEnabled', 'EnableMFA', 'IsMFAEnabled', 'MultiFactorAuthenticationEnabled')
+                        if ($null -ne $m) {
+                            $determined = $true
+                            if ($m -ne $true) { $noMfa += [string](Get-PropSafe -InputObject $u -Name @('AccountName', 'Name', 'Account')) }
+                        }
+                    }
+                    if ($determined) {
+                        if ($noMfa.Count -eq 0) { return @{ Status = 'Passed'; Value = ("All {0} account(s) have MFA enabled" -f $a.Count) } }
+                        return @{ Status = 'Failed'; Value = ("{0} of {1} account(s) WITHOUT MFA: {2}" -f $noMfa.Count, $a.Count, ($noMfa -join ', ')) }
+                    }
+                }
+            }
+            # Fallback: global MFA policy if per-user flags are not exposed by the SDK build.
             $c = Test-VeeamCmdlet -Name @('Get-VBRMFAConfiguration', 'Get-VBRSecurityMFAPolicy')
-            if (-not $c) { return @{ Status = 'Warning'; Value = 'MFA cmdlet unavailable' } }
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'Per-user MFA not enumerable; verify Users and Roles > Enable MFA per account' } }
             $en = Get-PropSafe -InputObject (& $c -ErrorAction Stop) -Name @('IsEnabled', 'Enabled', 'MfaEnabled')
-            @{ Status = $(if ($en -eq $true) { 'Passed' } elseif ($null -eq $en) { 'Warning' } else { 'Failed' }); Value = ("MFA enabled={0}" -f (nv $en)) }
+            @{ Status = $(if ($en -eq $true) { 'Passed' } elseif ($null -eq $en) { 'Warning' } else { 'Failed' }); Value = ("Global MFA policy enabled={0} (per-user flags not exposed by SDK)" -f (nv $en)) }
         }
 
     Invoke-Item -Num '5.3' -Topic $T -Name 'Is the Security Officer role configured and assigned for four-eyes authorization on critical operations?' `
@@ -882,10 +920,39 @@ function Invoke-AccountChecks {
             @{ Status = $(if ($so.Count -gt 0) { 'Passed' } else { 'Warning' }); Value = ("Security Officer configured: {0}" -f ($so.Count -gt 0)) }
         }
 
-    Invoke-Item -Num '5.4' -Topic $T -Name 'Is there a distinction between user accounts for day-to-day operation, and admin/configuration access to the backup server and infrastructure?' -Recommendation 'Separate day-to-day and admin/config accounts.'
+    # 5.4 Distinction of accounts - verify that both "Backup Operator" and "Restore Operator"
+    # roles are actually assigned (day-to-day operators distinct from admin/config access).
+    Invoke-Item -Num '5.4' -Topic $T -Name 'Is there a distinction between user accounts for day-to-day operation, and admin/configuration access to the backup server and infrastructure?' `
+        -Recommendation 'Assign distinct "Backup Operator" and "Restore Operator" roles for day-to-day operation, separate from administrators.' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $ac = Test-VeeamCmdlet -Name @('Get-VBRUserRoleAssignment', 'Get-VBRRbacRoleAssignment')
+            if (-not $ac) { return @{ Status = 'Warning'; Value = 'RBAC assignment cmdlet unavailable' } }
+            $a = @(& $ac -ErrorAction Stop)
+            $bak = @($a | Where-Object { (Get-PropSafe -InputObject $_ -Name @('Role', 'RoleName')) -match 'Backup Operator' })
+            $res = @($a | Where-Object { (Get-PropSafe -InputObject $_ -Name @('Role', 'RoleName')) -match 'Restore Operator' })
+            $bakN = ($bak | ForEach-Object { Get-PropSafe -InputObject $_ -Name @('AccountName', 'Name', 'Account') }) -join ', '
+            $resN = ($res | ForEach-Object { Get-PropSafe -InputObject $_ -Name @('AccountName', 'Name', 'Account') }) -join ', '
+            $st = if ($bak.Count -gt 0 -and $res.Count -gt 0) { 'Passed' } elseif ($bak.Count -gt 0 -or $res.Count -gt 0) { 'Warning' } else { 'Failed' }
+            @{ Status = $st; Value = ("Backup Operator: {0}; Restore Operator: {1}" -f $(if ($bakN) { $bakN } else { 'none' }), $(if ($resN) { $resN } else { 'none' })) }
+        }
     Invoke-Item -Num '5.5' -Topic $T -Name 'The backup and restore services accounts are different from the Veeam managed servers account' -Recommendation 'Use distinct service accounts (least privilege).'
     Invoke-Item -Num '5.6' -Topic $T -Name 'Is the security officer role defined and secured?' -Recommendation 'Define and secure the Security Officer role.'
-    Invoke-Item -Num '5.7' -Topic $T -Name 'Does each relevant user have their own Veeam administrative account' -Recommendation 'Give each admin an individual account (no shared accounts).'
+    # 5.7 List every VBR user account and group (with type + role) for manual review.
+    Invoke-Item -Num '5.7' -Topic $T -Name 'Does each relevant user have their own Veeam administrative account' `
+        -Recommendation 'Review the listed users/groups; each admin should have their own individual account (no shared accounts).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $ac = Test-VeeamCmdlet -Name @('Get-VBRUserRoleAssignment', 'Get-VBRRbacRoleAssignment')
+            if (-not $ac) { return @{ Status = 'Warning'; Value = 'RBAC assignment cmdlet unavailable' } }
+            $a = @(& $ac -ErrorAction Stop)
+            if ($a.Count -eq 0) { return @{ Status = 'Warning'; Value = 'No user/group role assignments found' } }
+            $list = $a | ForEach-Object {
+                $name = Get-PropSafe -InputObject $_ -Name @('AccountName', 'Name', 'Account')
+                $type = Get-PropSafe -InputObject $_ -Name @('AccountType', 'Type')
+                $role = Get-PropSafe -InputObject $_ -Name @('Role', 'RoleName')
+                "{0} [{1}] -> {2}" -f $name, (nv $type), (nv $role)
+            }
+            @{ Status = 'Warning'; Value = ("{0} account(s)/group(s) configured: {1}" -f $a.Count, ($list -join '; ')) }
+        }
 
     Invoke-Item -Num '5.8' -Topic $T -Name 'Are separate backup and restore operators defined?' `
         -Recommendation 'Define separate Backup and Restore Operator roles.' -Check {
@@ -910,11 +977,20 @@ function Invoke-AccountChecks {
     Invoke-Item -Num '5.11' -Topic $T -Name 'Is certificate-based authentication used in place of user-based authentication wherever possible?' -Recommendation 'Prefer certificate-based auth over passwords for remote access.'
     Invoke-Item -Num '5.12' -Topic $T -Name 'Do Linux systems leverage LDAP or AD?' -Recommendation 'Centralize Linux auth via LDAP/AD where applicable.'
     Invoke-Item -Num '5.13' -Topic $T -Name 'Do Linux/Unix Systems leverage NIS/NSS?' -Recommendation 'Centralize Linux/Unix account management (NIS/NSS) where applicable.'
-    Invoke-Item -Num '5.14' -Topic $T -Name 'Do Linux/Unix Systems use SSH Private/Public Key with Passphrase credentials?' -Recommendation 'Use SSH key + passphrase for Linux/Unix credentials.'
-    Invoke-Item -Num '5.15' -Topic $T -Name 'Does SSH use strong password enforcement where applicable? (min of 15 characters)' -Recommendation 'Enforce >=15-character SSH passwords where used.'
-    Invoke-Item -Num '5.16' -Topic $T -Name 'Is a dedicated, audited account used for repository access' -Recommendation 'Use a dedicated audited repository access account.'
-    Invoke-Item -Num '5.17' -Topic $T -Name 'Is the account for repository access NOT root, or a member of Sudoers' -Recommendation 'Repository account must not be root / in sudoers (KB2676).'
-    Invoke-Item -Num '5.18' -Topic $T -Name 'Where required, is LINUX service account "NOT" root but leverages SUDOER, Firewall and PAM security?' -Recommendation 'Use non-root Linux service account with SUDOER/PAM/firewall controls (KB2676).'
+    # 5.14 - 5.18 are Linux component checks (SSH / accounts / PAM / sudoers on the Linux
+    # repository or managed server). They cannot be verified from the Windows VBR host and
+    # are handled by the companion script Invoke-VbrLinuxComponentAudit.sh, which must be run
+    # ON the Linux component. They are reported here as Manual with that pointer.
+    Invoke-Item -Num '5.14' -Topic $T -Name 'Do Linux/Unix Systems use SSH Private/Public Key with Passphrase credentials?' `
+        -Check { @{ Status = 'Manual'; Value = 'Linux component - handled by companion script Invoke-VbrLinuxComponentAudit.sh (run on the Linux host)'; Recommendation = 'Use SSH key + passphrase for Linux/Unix credentials. Run Invoke-VbrLinuxComponentAudit.sh on the Linux repository/component host.' } }
+    Invoke-Item -Num '5.15' -Topic $T -Name 'Does SSH use strong password enforcement where applicable? (min of 15 characters)' `
+        -Check { @{ Status = 'Manual'; Value = 'Linux component - handled by companion script Invoke-VbrLinuxComponentAudit.sh (run on the Linux host)'; Recommendation = 'Enforce >=15-character SSH passwords where used. Run Invoke-VbrLinuxComponentAudit.sh on the Linux repository/component host.' } }
+    Invoke-Item -Num '5.16' -Topic $T -Name 'Is a dedicated, audited account used for repository access' `
+        -Check { @{ Status = 'Manual'; Value = 'Linux component - handled by companion script Invoke-VbrLinuxComponentAudit.sh (run on the Linux host)'; Recommendation = 'Use a dedicated audited repository access account. Run Invoke-VbrLinuxComponentAudit.sh on the Linux repository/component host.' } }
+    Invoke-Item -Num '5.17' -Topic $T -Name 'Is the account for repository access NOT root, or a member of Sudoers' `
+        -Check { @{ Status = 'Manual'; Value = 'Linux component - handled by companion script Invoke-VbrLinuxComponentAudit.sh (run on the Linux host)'; Recommendation = 'Repository account must not be root / in sudoers (KB2676). Run Invoke-VbrLinuxComponentAudit.sh on the Linux repository/component host.' } }
+    Invoke-Item -Num '5.18' -Topic $T -Name 'Where required, is LINUX service account "NOT" root but leverages SUDOER, Firewall and PAM security?' `
+        -Check { @{ Status = 'Manual'; Value = 'Linux component - handled by companion script Invoke-VbrLinuxComponentAudit.sh (run on the Linux host)'; Recommendation = 'Use non-root Linux service account with SUDOER/PAM/firewall controls (KB2676). Run Invoke-VbrLinuxComponentAudit.sh on the Linux repository/component host.' } }
     Invoke-Item -Num '5.19' -Topic $T -Name 'Is access to the VBR database restricted to only authorized users?' -Recommendation 'Restrict VBR (PostgreSQL) database access to authorized users.'
     Invoke-Item -Num '5.20' -Topic $T -Name 'Do only authorized users have access to all servers hosting VBR components?' `
         -Recommendation 'Restrict access to all VBR component servers.' -Check {
@@ -959,8 +1035,59 @@ function Invoke-AccountChecks {
             @{ Status = $(if ($svc.Count -gt 0) { 'Passed' } else { 'Warning' }); Value = ("{0} service(s) using a managed-service/gMSA-style account" -f $svc.Count) }
         }
 
-    Invoke-Item -Num '5.27' -Topic $T -Name 'Is Active Directory server protected using an unmanaged agent or crash consistent backup to avoid storing Domain admin account in Veeam DB ?' -Recommendation 'Protect DCs via unmanaged agent / crash-consistent backup to avoid storing DA creds.'
-    Invoke-Item -Num '5.28' -Topic $T -Name 'Is active alerting in place for unsuccessful login attempts?' -Recommendation 'Alert on failed login attempts.'
+    # 5.27 AD protected by an unmanaged agent / agent-based backup policy.
+    #   AD/DC agent backup policy found -> Passed ; none found -> Failed.
+    Invoke-Item -Num '5.27' -Topic $T -Name 'Is Active Directory server protected using an unmanaged agent or crash consistent backup to avoid storing Domain admin account in Veeam DB ?' `
+        -Recommendation 'Protect Domain Controllers via an unmanaged/agent backup policy to avoid storing Domain Admin creds in the Veeam DB.' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $found = @()
+            foreach ($cn in @('Get-VBRComputerBackupJob', 'Get-VBRAgentBackupJob', 'Get-VBRUnmanagedAgent', 'Get-VBRDiscoveredComputer')) {
+                $cc = Test-VeeamCmdlet -Name $cn
+                if ($cc) { try { $found += @(& $cc -ErrorAction SilentlyContinue) } catch { } }
+            }
+            if ($found.Count -eq 0) { return @{ Status = 'Failed'; Value = 'No agent-based / unmanaged agent backup policy found' } }
+            # Identify policies whose name targets Active Directory / Domain Controllers.
+            $ad = @($found | Where-Object { (Get-PropSafe -InputObject $_ -Name @('Name', 'JobName')) -match '(?i)active directory|domain|\bAD\b|\bDC\b' })
+            if ($ad.Count -gt 0) {
+                @{ Status = 'Passed'; Value = ("AD protected by agent policy: {0}" -f (($ad | ForEach-Object { Get-PropSafe -InputObject $_ -Name @('Name', 'JobName') }) -join ', ')) }
+            }
+            else {
+                @{ Status = 'Failed'; Value = ("{0} agent policy/policies found but none identified as AD/DC - confirm AD is protected by an unmanaged agent" -f $found.Count) }
+            }
+        }
+    # 5.28 Active alerting - satisfied by Veeam ONE integration OR a syslog server.
+    #   Either configured -> Passed (report what is configured) ; neither -> Failed.
+    Invoke-Item -Num '5.28' -Topic $T -Name 'Is active alerting in place for unsuccessful login attempts?' `
+        -Recommendation 'Integrate with Veeam ONE or forward events to a syslog/SIEM server for login-failure alerting.' -Check {
+            $configured = @()
+            # Syslog forwarding (requires VBR session).
+            if ($script:VbrConnected) {
+                $sc = Test-VeeamCmdlet -Name @('Get-VBRSyslogServer', 'Get-VBRSyslogServerInfo')
+                if ($sc) {
+                    try {
+                        $s = @(& $sc -ErrorAction Stop)
+                        if ($s.Count -gt 0) {
+                            $t = $s | ForEach-Object {
+                                $h = Get-PropSafe -InputObject $_ -Name @('ServerHost', 'Host', 'Address', 'Name', 'ServerName')
+                                $p = Get-PropSafe -InputObject $_ -Name @('Port', 'ServerPort')
+                                if ($p) { "$h`:$p" } else { "$h" }
+                            }
+                            $configured += ("Syslog: " + ($t -join ', '))
+                        }
+                    } catch { }
+                }
+            }
+            # Veeam ONE presence on this host (service or registry).
+            $vone = $false
+            try { if (@(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'Veeam ONE' }).Count -gt 0) { $vone = $true } } catch { }
+            if (-not $vone) {
+                if ((Test-Path 'HKLM:\SOFTWARE\Veeam\Veeam ONE Monitor') -or (Test-Path 'HKLM:\SOFTWARE\Veeam\Veeam ONE Server') -or (Test-Path 'HKLM:\SOFTWARE\Veeam\Veeam ONE Reporter')) { $vone = $true }
+            }
+            if ($vone) { $configured += 'Veeam ONE detected on host' }
+
+            if ($configured.Count -gt 0) { @{ Status = 'Passed'; Value = ($configured -join ' | ') } }
+            else { @{ Status = 'Failed'; Value = 'Neither Veeam ONE integration nor a syslog server detected' } }
+        }
     Invoke-Item -Num '5.29' -Topic $T -Name 'Are permissions applied to the hypervisor control plane applied using the principle of least privilege?' -Recommendation 'Apply least privilege to hypervisor control-plane permissions.'
     Invoke-Item -Num '5.30' -Topic $T -Name 'Are permissions applied to protected recoverable applications being protected by Veeam using the principle of least privilege?' -Recommendation 'Apply least privilege to application processing accounts.'
 

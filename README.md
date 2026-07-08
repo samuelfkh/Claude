@@ -75,7 +75,7 @@ Every numbered item is represented. Highlights of what is **automatically verifi
 | **1 Components**                 | 1.1 NTLM, 1.2 patch recency + Veeam Updater, 1.3 LTS/LTSC build, 1.4 VBR build (KB2680), 1.5 sole-tenant roles, 1.6 domain separation, 1.8 firewall, 1.9 config-DB encryption, 1.11 TPM/Secure Boot, 1.16 console MFA, 1.18 SSL2/SMB1, 1.19 inactivity timeout, 1.20 naming, 1.21 syslog, 1.23 health check, 1.24 CDP |
 | **2 Components – Windows Build** | 2.1/2.8 Defender/AV, 2.3 config-DB backup off-host, 2.4 RemoteRegistry, 2.5 WinRM (StartMode Disabled→Pass / Auto→Fail), 2.6 WDigest, 2.7 WPAD, 2.9 RDP, 2.10 WSH, 2.11 LLMNR |
 | **4 Repositories**               | 4.1 object-lock, 4.3 hardened, 4.4 immutable roll-up, 4.10 time services, 4.13 backup copies, 4.15 SOBR capacity tier, 4.18 Linux immutability |
-| **5 Accounts and Permissions**   | 5.2 MFA, 5.3/5.31 Security Officer / four-eyes, 5.8/5.32 RBAC roles, 5.9/5.20 local Administrators, 5.21 audit policy, 5.23 password policy, 5.24 lockout policy, 5.26 gMSA |
+| **5 Accounts and Permissions**   | 5.1 SAML identity provider, 5.2 per-user MFA, 5.3/5.31 Security Officer / four-eyes, 5.4 Backup/Restore Operator roles, 5.7 user & group listing, 5.8/5.32 RBAC roles, 5.9/5.20 local Administrators, 5.21 audit policy, 5.23 password policy, 5.24 lockout policy, 5.26 gMSA, 5.27 AD agent policy, 5.28 Veeam ONE / syslog alerting. **5.14–5.18 (Linux) are delegated to `Invoke-VbrLinuxComponentAudit.sh`** |
 | **6 Encryption**                 | 6.2 KMS, 6.4 SMB signing/encryption, 6.5 job encryption, 6.6 network encryption, 6.12 repo encryption |
 | **7 Operational**                | 7.1 Security/Best-Practice Analyzer presence                                                          |
 | **8 NAS-specific**               | 8.2 network encryption rule, 8.3 firewall, 8.5 secondary copy                                         |
@@ -83,8 +83,29 @@ Every numbered item is represented. Highlights of what is **automatically verifi
 | **10 Detection**                 | 10.1 malware scan, 10.2 entropy, 10.3 suspicious files, 10.11 IOC, 10.14 Linux, 10.16 AI anomaly      |
 
 Remaining items (physical security, staff training, network topology, SAN isolation,
-Linux SSH/PAM specifics, process/regimen questions, etc.) are reported as **Manual** with
-guidance, since they cannot be determined from the Windows VBR host.
+process/regimen questions, etc.) are reported as **Manual** with guidance, since they
+cannot be determined from the Windows VBR host.
+
+## Companion Linux script (`Invoke-VbrLinuxComponentAudit.sh`)
+
+Checklist items **5.14–5.18** are Linux checks (SSH config, PAM, sudoers, firewall,
+account privileges) on the hardened repository / Linux managed server. The Windows script
+reports them as `Manual` and points here. Run this Bash script **on the Linux component**
+(as root/sudo); it emits the same columns (`Item #,Compliance,Topic,Rule Name,Status,
+Current Value,Recommendation`) to console + CSV.
+
+```bash
+sudo ./Invoke-VbrLinuxComponentAudit.sh -a <repo_account> [-o report.csv]
+```
+
+- `-a REPO_ACCOUNT` — the Linux account Veeam uses for repository/service access; enables
+  the account-specific checks (5.16–5.18). Without it those items return `Warning` and
+  list candidate non-system accounts.
+- `-o FILE` — CSV output path (defaults to `./VBR_Linux_Audit_<host>_<timestamp>.csv`).
+- Checks: 5.14 SSH pubkey vs password auth (passphrase noted as manual), 5.15 password
+  `minlen>=15` (pwquality/PAM/login.defs), 5.16 dedicated account + `auditd`, 5.17 account
+  not root / not in sudoers or sudo/wheel, 5.18 non-root + firewall (firewalld/ufw/
+  nftables/iptables) + PAM.
 
 ## Notes & limitations
 
