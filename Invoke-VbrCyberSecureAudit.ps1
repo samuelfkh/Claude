@@ -2,94 +2,83 @@
 <#
 .SYNOPSIS
     Automated Cyber Secure compliance audit for Veeam Backup & Replication (VBR) v13
-    running on Windows Server.
+    running on Windows Server, mapped item-by-item to the VDP v13 Cyber Secure Checklist.
 
 .DESCRIPTION
-    Evaluates the local Windows Server / VBR instance against a curated subset of the
-    Veeam Data Platform (VDP) v13 Cyber Secure Checklist. Checks are grouped into the
-    following topics:
+    Every numbered checklist item (1.1 - 10.17) is represented in the output, tagged with
+    its checklist number and exact name. Items that can be verified programmatically from
+    the Windows VBR host are checked automatically via:
 
-        1. Components               - NTLM deprecation, OS patching / Veeam Updater,
-                                       LTS/LTSC OS build, Veeam software version.
-        2. Components - Windows Build - Legacy service / protocol hardening baseline
-                                       (RemoteRegistry, WinRM, WDigest, WPAD, WSH,
-                                       LLMNR, SMBv1, RDP, SSL 2.0).
-        3. Repositories             - Hardened / immutable repository configuration.
-        4. Accounts and Permissions - Local Administrators least-privilege review and
-                                       Veeam RBAC (security role) assignments.
-        5. Encryption               - Backup job encryption, network traffic encryption,
-                                       KMS integration.
-        6. Detection                - Malware detection, Guest Index / IOC scanning,
-                                       Linux workload scanning, inline entropy / AI-based
-                                       anomaly detection.
+        * Windows registry / WMI / CIM
+        * Local security policy (secedit) and audit policy (auditpol)
+        * The Veeam v13 PowerShell SDK (Veeam.Backup.PowerShell)
 
-    The script auto-detects and imports the Veeam.Backup.PowerShell module, verifies it
-    is running elevated, connects (and self-tests) to the local VBR server, executes the
-    audit, prints a color-coded summary to the console, and exports an HTML and/or CSV
-    compliance report to the local directory.
+    Items that are inherently manual (physical security, staff training, network topology,
+    the Linux VSA appliance section, off-host process, etc.) are reported with a "Manual"
+    status and actionable guidance so the report remains a complete, traceable mirror of
+    the checklist rather than a partial one.
 
-    Because Veeam SDK object/property names can differ slightly between v13 patch levels,
-    the script uses defensive property probing (Get-Command / property discovery) so a
-    renamed cmdlet or property degrades gracefully to a "Warning" instead of a hard error.
+    Checklist sections:
+        1  Components
+        2  Components - Windows Build
+        3  Components - VSA Build            (Linux appliance - verify on the VSA)
+        4  Repositories
+        5  Accounts and Permissions
+        6  Encryption
+        7  Operational
+        8  NAS-specific
+        9  Disaster Recovery & Testing
+        10 Detection
 
 .PARAMETER Credential
-    Optional [PSCredential] used with Connect-VBRServer. Supply this when running the
-    audit remotely, or when the current user context is not authorized against the VBR
-    server. If omitted, the script first attempts a connection under the current
-    (administrative) user context and only prompts via Get-Credential if that fails.
+    Optional [PSCredential] used with Connect-VBRServer (remote / explicit auth). If
+    omitted, the script connects under the current user context and only prompts via
+    Get-Credential if that non-interactive attempt fails.
 
 .PARAMETER VBRServer
-    Host name / IP of the VBR server to audit. Defaults to 'localhost' (local instance).
+    Host name / IP of the VBR server. Defaults to 'localhost'.
 
 .PARAMETER ReportPath
-    Directory in which the HTML / CSV report(s) are written. Defaults to the current
-    working directory.
+    Directory for the HTML / CSV report(s). Defaults to the current directory.
 
 .PARAMETER ReportFormat
-    Report output format: HTML, CSV, or Both (default).
+    HTML, CSV, or Both (default).
+
+.PARAMETER IncludeManual
+    Include inherently-manual checklist items in the report (default $true). Set to $false
+    to emit only script-verifiable items.
 
 .PARAMETER LatestKnownVbrBuild
-    The latest known VBR v13 build number to compare the installed build against. Update
-    this value from https://www.veeam.com/kb2680 when a new patch ships.
+    Latest known VBR v13 build for the version comparison (see KB2680).
 
 .EXAMPLE
     .\Invoke-VbrCyberSecureAudit.ps1
-
-    Runs the full audit against the local VBR server under the current admin context and
-    writes HTML + CSV reports to the current directory.
 
 .EXAMPLE
     $cred = Get-Credential
     .\Invoke-VbrCyberSecureAudit.ps1 -VBRServer 'vbr01.corp.local' -Credential $cred -ReportFormat HTML
 
-    Connects to a remote VBR server with explicit credentials and writes only an HTML report.
-
 .NOTES
     Author : Windows Security Engineer / Veeam Certified Architect
     Target : Veeam Backup & Replication v13 on Windows Server (LTSC)
     Module : Veeam.Backup.PowerShell
-
-    Reference links (per checklist item) are embedded in each check's Recommendation field.
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(HelpMessage = 'Credentials for Connect-VBRServer (remote / explicit auth).')]
     [System.Management.Automation.PSCredential]
     [System.Management.Automation.Credential()]
     $Credential,
 
-    [Parameter(HelpMessage = 'VBR server to connect to. Defaults to localhost.')]
     [string]$VBRServer = 'localhost',
 
-    [Parameter(HelpMessage = 'Directory for the compliance report(s).')]
     [string]$ReportPath = (Get-Location).Path,
 
-    [Parameter(HelpMessage = 'Report format.')]
     [ValidateSet('HTML', 'CSV', 'Both')]
     [string]$ReportFormat = 'Both',
 
-    [Parameter(HelpMessage = 'Latest known VBR v13 build (see KB2680).')]
+    [bool]$IncludeManual = $true,
+
     [string]$LatestKnownVbrBuild = '13.0.0.4967'
 )
 
@@ -98,30 +87,33 @@ $ErrorActionPreference = 'Stop'
 
 #region ----------------------------------------------------------------------- Infrastructure
 
-# Master results collection. Every check appends a [PSCustomObject] here.
-$script:Results = [System.Collections.Generic.List[object]]::new()
-
-# Tracks whether we successfully opened a Veeam SDK session (so we can skip / warn on
-# VBR-dependent checks and disconnect cleanly at the end).
+$script:Results     = [System.Collections.Generic.List[object]]::new()
 $script:VbrConnected = $false
 
+# --- Caches (SDK / OS queries reused by several checklist items) ----------------------
+$script:_repos = $null                     # Get-VBRBackupRepository (+ object storage)
+$script:_jobs  = $null                     # Get-VBRJob
+$script:_mw = $null; $script:_mwLoaded = $false          # malware detection options
+$script:_admins = $null; $script:_adminsLoaded = $false  # local Administrators members
+$script:_secpol = $null                    # secedit [System Access] export
+
 <#
-    Add-AuditResult
-    ---------------
-    Central factory for the required PSCustomObject shape and the single point of
-    color-coded live console output. Every individual check calls this exactly once.
+    Add-AuditResult - the single PSCustomObject factory + color-coded console writer.
+    Shape (per requirement, now carrying the checklist number + exact name):
+        Item # | Topic | Rule Name | Status | Current Value | Recommendation
 #>
 function Add-AuditResult {
     [CmdletBinding()]
     param(
+        [Parameter(Mandatory)][string]$ItemNumber,
         [Parameter(Mandatory)][string]$Topic,
         [Parameter(Mandatory)][string]$RuleName,
-        [Parameter(Mandatory)][ValidateSet('Passed', 'Failed', 'Warning', 'Error', 'Info')][string]$Status,
+        [Parameter(Mandatory)][ValidateSet('Passed', 'Failed', 'Warning', 'Error', 'Manual', 'Info')][string]$Status,
         [Parameter()][string]$CurrentValue = 'N/A',
         [Parameter()][string]$Recommendation = ''
     )
-
     $result = [PSCustomObject]@{
+        'Item #'         = $ItemNumber
         Topic            = $Topic
         'Rule Name'      = $RuleName
         Status           = $Status
@@ -130,80 +122,152 @@ function Add-AuditResult {
     }
     $script:Results.Add($result)
 
-    # Live, color-coded feedback (Green pass / Red fail / Yellow warning / etc.).
     $color = switch ($Status) {
         'Passed'  { 'Green' }
         'Failed'  { 'Red' }
         'Warning' { 'Yellow' }
         'Error'   { 'Magenta' }
+        'Manual'  { 'DarkCyan' }
         default   { 'Cyan' }
     }
-    Write-Host ('  [{0,-7}] ' -f $Status) -ForegroundColor $color -NoNewline
-    Write-Host ('{0}' -f $RuleName) -ForegroundColor Gray
+    Write-Host ('  {0,-6} [{1,-7}] ' -f $ItemNumber, $Status) -ForegroundColor $color -NoNewline
+    Write-Host $RuleName -ForegroundColor Gray
     if ($CurrentValue -and $CurrentValue -ne 'N/A') {
-        Write-Host ('            -> {0}' -f $CurrentValue) -ForegroundColor DarkGray
+        Write-Host ('              -> {0}' -f $CurrentValue) -ForegroundColor DarkGray
     }
-    return $result
 }
 
 <#
-    Get-RegistryValue
-    -----------------
-    Safe registry read. Returns $null if the key/value is absent instead of throwing,
-    so "value not set" can be treated as its own compliance state.
+    Invoke-Item - runs a single checklist item.
+      * No -Check scriptblock          -> emitted as "Manual".
+      * -Check present                 -> executed in a try/catch; must return a
+                                          [hashtable] @{ Status=..; Value=..; [Recommendation=..] }.
+    Wrapping each item individually means one failing check degrades to "Error" for that
+    row only - the rest of the audit still completes.
 #>
-function Get-RegistryValue {
+function Invoke-Item {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Name
+        [Parameter(Mandatory)][string]$Num,
+        [Parameter(Mandatory)][string]$Topic,
+        [Parameter(Mandatory)][string]$Name,
+        [string]$Recommendation = 'Verify manually against the VDP v13 Cyber Secure Checklist.',
+        [scriptblock]$Check
     )
+    if (-not $Check) {
+        if ($IncludeManual) {
+            Add-AuditResult -ItemNumber $Num -Topic $Topic -RuleName $Name -Status 'Manual' `
+                -CurrentValue 'Not script-verifiable' -Recommendation $Recommendation
+        }
+        return
+    }
     try {
-        if (-not (Test-Path -LiteralPath $Path)) { return $null }
-        $item = Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop
-        return $item.$Name
+        $r = & $Check
+        if ($r -is [System.Array]) { $r = $r[-1] }              # tolerate stray pipeline output
+        if ($r -isnot [hashtable]) { throw 'Check did not return a hashtable.' }
+        $val = if ($r.ContainsKey('Value') -and $r.Value) { [string]$r.Value } else { 'N/A' }
+        $rec = if ($r.ContainsKey('Recommendation') -and $r.Recommendation) { $r.Recommendation } else { $Recommendation }
+        Add-AuditResult -ItemNumber $Num -Topic $Topic -RuleName $Name -Status $r.Status -CurrentValue $val -Recommendation $rec
     }
     catch {
-        return $null
+        Add-AuditResult -ItemNumber $Num -Topic $Topic -RuleName $Name -Status 'Error' `
+            -CurrentValue $_.Exception.Message -Recommendation $Recommendation
     }
 }
 
-<#
-    Get-PropSafe
-    ------------
-    Returns the first matching property value from an object across a list of candidate
-    names (Veeam property names drift across patch levels). Returns $null if none exist.
-#>
+# --- Low-level helpers ----------------------------------------------------------------
+
+function Get-RegistryValue {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name)
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return $null }
+        return (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name
+    } catch { return $null }
+}
+
+# Returns the first present property value from a list of candidate names ($null if none).
 function Get-PropSafe {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]$InputObject,
-        [Parameter(Mandatory)][string[]]$Name
-    )
+    param([Parameter(Mandatory)]$InputObject, [Parameter(Mandatory)][string[]]$Name)
     if ($null -eq $InputObject) { return $null }
     $props = ($InputObject | Get-Member -MemberType Properties -ErrorAction SilentlyContinue).Name
-    foreach ($candidate in $Name) {
-        if ($props -contains $candidate) {
-            try { return $InputObject.$candidate } catch { }
-        }
-    }
+    foreach ($c in $Name) { if ($props -contains $c) { try { return $InputObject.$c } catch { } } }
     return $null
 }
 
-<#
-    Test-VeeamCmdlet
-    ----------------
-    Returns the resolved cmdlet name from a list of candidates (or $null). Lets checks
-    tolerate cmdlet renames between builds without failing the whole audit.
-#>
+# Resolves the first available cmdlet from a candidate list (tolerates SDK renames).
 function Test-VeeamCmdlet {
-    [CmdletBinding()]
     param([Parameter(Mandatory)][string[]]$Name)
-    foreach ($candidate in $Name) {
-        $cmd = Get-Command -Name $candidate -ErrorAction SilentlyContinue
-        if ($cmd) { return $cmd.Name }
-    }
+    foreach ($c in $Name) { $cmd = Get-Command -Name $c -ErrorAction SilentlyContinue; if ($cmd) { return $cmd.Name } }
     return $null
+}
+
+# Formats a possibly-null value for display.
+function nv { param($v) if ($null -eq $v) { 'not set' } else { "$v" } }
+
+# Evaluates whether a Windows service is disabled; returns an Invoke-Item hashtable.
+# Defined at script scope so it resolves reliably from within passed-in check scriptblocks.
+function Test-SvcDisabled {
+    param([Parameter(Mandatory)][string]$Name, [string]$Severity = 'Failed')
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if (-not $svc) { return @{ Status = 'Passed'; Value = "Service '$Name' not present" } }
+    $mode = (Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction Stop).StartMode
+    @{ Status = $(if ($mode -eq 'Disabled') { 'Passed' } else { $Severity }); Value = ("StartMode={0}; Status={1}" -f $mode, $svc.Status) }
+}
+
+# --- Cached collections ---------------------------------------------------------------
+
+function Get-Repos {
+    if (-not $script:VbrConnected) { return @() }
+    if ($null -ne $script:_repos) { return $script:_repos }
+    $list = @()
+    try { $list = @(Get-VBRBackupRepository -ErrorAction Stop) } catch { }
+    $oc = Test-VeeamCmdlet -Name 'Get-VBRObjectStorageRepository'
+    if ($oc) { try { $list += @(& $oc -ErrorAction SilentlyContinue) } catch { } }
+    $script:_repos = $list
+    return $script:_repos
+}
+
+function Get-Jobs {
+    if (-not $script:VbrConnected) { return @() }
+    if ($null -ne $script:_jobs) { return $script:_jobs }
+    try { $script:_jobs = @(Get-VBRJob -ErrorAction Stop) } catch { $script:_jobs = @() }
+    return $script:_jobs
+}
+
+function Get-MalwareOpts {
+    if ($script:_mwLoaded) { return $script:_mw }
+    $script:_mwLoaded = $true
+    if (-not $script:VbrConnected) { return $null }
+    $c = Test-VeeamCmdlet -Name @('Get-VBRMalwareDetectionOptions', 'Get-VBRMalwareDetection')
+    if ($c) { try { $script:_mw = & $c -ErrorAction Stop } catch { } }
+    return $script:_mw
+}
+
+function Get-Admins {
+    if ($script:_adminsLoaded) { return $script:_admins }
+    $script:_adminsLoaded = $true
+    try { $script:_admins = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction Stop) } catch { $script:_admins = $null }
+    return $script:_admins
+}
+
+# Parses the [System Access] section of a secedit export (locale-independent password /
+# lockout policy). Cached for the lifetime of the run.
+function Get-SecPol {
+    if ($null -ne $script:_secpol) { return $script:_secpol }
+    $script:_secpol = @{}
+    try {
+        $tmp = Join-Path $env:TEMP ("vbrsec_{0}.inf" -f ([guid]::NewGuid().ToString('N')))
+        & secedit.exe /export /cfg $tmp /quiet 2>$null | Out-Null
+        if (Test-Path -LiteralPath $tmp) {
+            foreach ($line in (Get-Content -LiteralPath $tmp -Encoding Unicode -ErrorAction Stop)) {
+                if ($line -match '^\s*([A-Za-z]\w+)\s*=\s*(.+?)\s*$') {
+                    $script:_secpol[$matches[1]] = $matches[2]
+                }
+            }
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
+    return $script:_secpol
 }
 
 #endregion
@@ -216,28 +280,19 @@ Write-Host '  Veeam VBR v13 - VDP Cyber Secure Compliance Audit' -ForegroundColo
 Write-Host ('  Host: {0}   Date: {1}' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyy-MM-dd HH:mm')) -ForegroundColor Cyan
 Write-Host '===============================================================' -ForegroundColor Cyan
 
-# --- Administrative privilege check ---------------------------------------------------
-# Registry hardening and VBR service inspection require elevation.
+# Administrative privilege check.
 $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-$isAdmin   = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-if (-not $isAdmin) {
-    Write-Host ''
-    Write-Warning 'This script must be run in an ELEVATED (Run as Administrator) PowerShell session.'
-    Write-Warning 'Registry, service and VBR checks will be unreliable without elevation. Aborting.'
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Warning 'This script must be run ELEVATED (Run as Administrator). Aborting.'
     throw 'Administrative privileges required.'
 }
 Write-Host "`n[+] Administrative context confirmed." -ForegroundColor Green
 
-# --- Import the Veeam PowerShell module ----------------------------------------------
-# v12+/v13 ships the module 'Veeam.Backup.PowerShell'. Older installs used the PSSnapin
-# 'VeeamPSSnapIn'. We try the module first, then fall back to the snap-in.
+# Import the Veeam PowerShell module (module first, then legacy snap-in).
 $script:VeeamModuleLoaded = $false
 try {
-    if (Get-Module -Name 'Veeam.Backup.PowerShell') {
-        $script:VeeamModuleLoaded = $true
-    }
+    if (Get-Module -Name 'Veeam.Backup.PowerShell') { $script:VeeamModuleLoaded = $true }
     elseif (Get-Module -ListAvailable -Name 'Veeam.Backup.PowerShell') {
         Import-Module 'Veeam.Backup.PowerShell' -DisableNameChecking -ErrorAction Stop
         $script:VeeamModuleLoaded = $true
@@ -246,62 +301,32 @@ try {
         Add-PSSnapin -Name 'VeeamPSSnapIn' -ErrorAction Stop
         $script:VeeamModuleLoaded = $true
     }
-
-    if ($script:VeeamModuleLoaded) {
-        Write-Host '[+] Veeam PowerShell module loaded.' -ForegroundColor Green
-    }
-    else {
-        Write-Warning 'Veeam.Backup.PowerShell module not found. VBR-specific checks will be skipped.'
-    }
+    if ($script:VeeamModuleLoaded) { Write-Host '[+] Veeam PowerShell module loaded.' -ForegroundColor Green }
+    else { Write-Warning 'Veeam.Backup.PowerShell not found - VBR-specific items degrade to Warning.' }
 }
-catch {
-    Write-Warning ('Failed to import the Veeam PowerShell module: {0}' -f $_.Exception.Message)
-}
+catch { Write-Warning ('Failed to import the Veeam PowerShell module: {0}' -f $_.Exception.Message) }
 
 #endregion
 
 #region ----------------------------------------------------------------------- VBR session
 
-<#
-    Connect-VbrSession
-    ------------------
-    Establishes and self-tests a Veeam SDK session against $VBRServer.
-
-    Precedence:
-      1. If -Credential supplied  -> connect with it.
-      2. Else connect under current user context (non-interactive).
-      3. If that fails            -> prompt with Get-Credential and retry once.
-
-    Sets $script:VbrConnected on success. Non-fatal: VBR-dependent checks degrade to
-    "Warning" if no session can be opened.
-#>
 function Connect-VbrSession {
-    [CmdletBinding()]
-    param()
-
     if (-not $script:VeeamModuleLoaded) { return }
-
-    $connectCmd = Test-VeeamCmdlet -Name 'Connect-VBRServer'
-    if (-not $connectCmd) {
-        Write-Warning 'Connect-VBRServer cmdlet unavailable; cannot open a VBR session.'
-        return
+    if (-not (Test-VeeamCmdlet -Name 'Connect-VBRServer')) {
+        Write-Warning 'Connect-VBRServer unavailable; cannot open a VBR session.'; return
     }
 
-    # If a live session already exists (e.g. console already open), reuse it.
+    # Reuse an existing session if the console/service already has one open.
     $sessCmd = Test-VeeamCmdlet -Name 'Get-VBRServerSession'
     if ($sessCmd) {
         try {
-            $existing = & $sessCmd -ErrorAction SilentlyContinue
-            if ($existing) {
+            if (& $sessCmd -ErrorAction SilentlyContinue) {
                 Write-Host '[+] Reusing existing VBR server session.' -ForegroundColor Green
-                $script:VbrConnected = $true
-                return
+                $script:VbrConnected = $true; return
             }
-        }
-        catch { <# no active session; proceed to connect #> }
+        } catch { }
     }
 
-    # Attempt 1: explicit credentials, else current context.
     try {
         if ($Credential) {
             Write-Host ('[*] Connecting to VBR ({0}) with supplied credentials...' -f $VBRServer) -ForegroundColor Cyan
@@ -315,36 +340,20 @@ function Connect-VbrSession {
     }
     catch {
         Write-Warning ('Initial VBR connection failed: {0}' -f $_.Exception.Message)
-
-        # Fallback: prompt interactively (only if no credential was supplied).
         if (-not $Credential) {
             try {
-                Write-Host '[*] Prompting for credentials to retry the VBR connection...' -ForegroundColor Yellow
+                Write-Host '[*] Prompting for credentials to retry...' -ForegroundColor Yellow
                 $promptCred = Get-Credential -Message ("Credentials for VBR server '{0}'" -f $VBRServer)
-                if ($promptCred) {
-                    Connect-VBRServer -Server $VBRServer -Credential $promptCred -ErrorAction Stop
-                    $script:VbrConnected = $true
-                }
-            }
-            catch {
-                Write-Warning ('VBR connection retry failed: {0}' -f $_.Exception.Message)
-            }
+                if ($promptCred) { Connect-VBRServer -Server $VBRServer -Credential $promptCred -ErrorAction Stop; $script:VbrConnected = $true }
+            } catch { Write-Warning ('VBR connection retry failed: {0}' -f $_.Exception.Message) }
         }
     }
 
-    # Self-test: confirm the session actually responds to a benign query.
     if ($script:VbrConnected) {
-        try {
-            $null = Get-VBRServer -ErrorAction Stop
-            Write-Host '[+] VBR session established and self-test passed.' -ForegroundColor Green
-        }
-        catch {
-            Write-Warning ('VBR session self-test failed: {0}' -f $_.Exception.Message)
-            $script:VbrConnected = $false
-        }
+        try { $null = Get-VBRServer -ErrorAction Stop; Write-Host '[+] VBR session established and self-test passed.' -ForegroundColor Green }
+        catch { Write-Warning ('VBR session self-test failed: {0}' -f $_.Exception.Message); $script:VbrConnected = $false }
     }
 }
-
 Connect-VbrSession
 
 #endregion
@@ -353,651 +362,822 @@ Connect-VbrSession
 
 function Invoke-ComponentChecks {
     Write-Host "`n--- 1. Components ---" -ForegroundColor White
+    $T = 'Components'
 
-    # 1.1 NTLM deprecation in favour of Kerberos ---------------------------------------
-    # LmCompatibilityLevel 5 = "Send NTLMv2 response only. Refuse LM & NTLM."
-    # RestrictSendingNTLMTraffic 2 = "Deny all" outbound NTLM (strongest deprecation).
-    try {
-        $lm  = Get-RegistryValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'LmCompatibilityLevel'
-        $restrict = Get-RegistryValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' -Name 'RestrictSendingNTLMTraffic'
-
-        $lmText = if ($null -eq $lm) { 'not set (OS default = 3)' } else { $lm }
-        $restrictText = switch ($restrict) {
-            0       { 'Allow all' }
-            1       { 'Audit all' }
-            2       { 'Deny all' }
-            $null   { 'not set' }
-            default { "$restrict" }
+    # 1.1 NTLM deprecation (LmCompatibilityLevel 5 / RestrictSendingNTLMTraffic 2).
+    Invoke-Item -Num '1.1' -Topic $T -Name 'Has NTLM authentication been completely deprecated in favor of Kerberos?' `
+        -Recommendation 'Set LmCompatibilityLevel=5 and RestrictSendingNTLMTraffic=2 (Deny all) so only Kerberos/NTLMv2 is honoured.' -Check {
+            $lm = Get-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LmCompatibilityLevel'
+            $rs = Get-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' 'RestrictSendingNTLMTraffic'
+            $st = if ($rs -eq 2 -or $lm -ge 5) { 'Passed' } elseif ($lm -ge 3) { 'Warning' } else { 'Failed' }
+            @{ Status = $st; Value = ("LmCompatibilityLevel={0}; RestrictSendingNTLMTraffic={1}" -f (nv $lm), (nv $rs)) }
         }
 
-        if ($restrict -eq 2 -or $lm -ge 5) {
-            $status = 'Passed'
-        }
-        elseif ($lm -ge 3) {
-            $status = 'Warning'
-        }
-        else {
-            $status = 'Failed'
-        }
-
-        Add-AuditResult -Topic 'Components' -RuleName 'NTLM authentication deprecated in favour of Kerberos' `
-            -Status $status `
-            -CurrentValue ("LmCompatibilityLevel={0}; RestrictSendingNTLMTraffic={1}" -f $lmText, $restrictText) `
-            -Recommendation 'Set LmCompatibilityLevel=5 and RestrictSendingNTLMTraffic=2 (Deny all) so only Kerberos/NTLMv2 is honoured. Validate no service breakage first.' | Out-Null
-    }
-    catch {
-        Add-AuditResult -Topic 'Components' -RuleName 'NTLM authentication deprecated in favour of Kerberos' `
-            -Status 'Error' -CurrentValue $_.Exception.Message `
-            -Recommendation 'Unable to read LSA registry keys; verify manually.' | Out-Null
-    }
-
-    # 1.2 OS patching + Veeam Updater --------------------------------------------------
-    # Windows Update recency via Get-HotFix, plus presence of a Veeam Updater
-    # service / scheduled task. (Ref: TechNet Windows Server patching best practices.)
-    try {
-        $latestHotfix = Get-HotFix -ErrorAction Stop |
-            Where-Object { $_.InstalledOn } |
-            Sort-Object InstalledOn -Descending |
-            Select-Object -First 1
-
-        $daysSince = if ($latestHotfix) { (New-TimeSpan -Start $latestHotfix.InstalledOn -End (Get-Date)).Days } else { $null }
-
-        # Veeam Updater surfaces as a service (VeeamUpdaterSvc / Veeam.Updater) and/or a
-        # scheduled task. Detect either.
-        $updaterSvc = Get-Service -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match 'Updater' -and $_.DisplayName -match 'Veeam' }
-        $updaterTask = $null
-        if (Get-Command -Name Get-ScheduledTask -ErrorAction SilentlyContinue) {
-            $updaterTask = Get-ScheduledTask -ErrorAction SilentlyContinue |
-                Where-Object { $_.TaskName -match 'Veeam' -and $_.TaskName -match 'Update' }
-        }
-
-        $hotfixText = if ($latestHotfix) {
-            "Last hotfix {0} on {1} ({2} days ago)" -f $latestHotfix.HotFixID, $latestHotfix.InstalledOn.ToString('yyyy-MM-dd'), $daysSince
-        } else { 'No dated hotfixes found' }
-        $updaterText = "Veeam Updater service: {0}; scheduled task: {1}" -f `
-            $(if ($updaterSvc) { 'present' } else { 'absent' }), `
-            $(if ($updaterTask) { 'present' } else { 'absent' })
-
-        if ($daysSince -ne $null -and $daysSince -le 35 -and ($updaterSvc -or $updaterTask)) {
-            $status = 'Passed'
-        }
-        elseif ($daysSince -ne $null -and $daysSince -le 35) {
-            $status = 'Warning'
-        }
-        else {
-            $status = 'Failed'
-        }
-
-        Add-AuditResult -Topic 'Components' -RuleName 'OS patched / auto-update via Veeam Updater' `
-            -Status $status -CurrentValue ("{0}. {1}" -f $hotfixText, $updaterText) `
-            -Recommendation 'Keep OS patched within one cycle (<=35 days) and configure the Veeam Updater service/task for continuous component patching.' | Out-Null
-    }
-    catch {
-        Add-AuditResult -Topic 'Components' -RuleName 'OS patched / auto-update via Veeam Updater' `
-            -Status 'Error' -CurrentValue $_.Exception.Message `
-            -Recommendation 'Verify Windows Update and Veeam Updater configuration manually.' | Out-Null
-    }
-
-    # 1.3 LTS / LTSC OS build ----------------------------------------------------------
-    # Cross-reference the running build number against known Windows Server LTSC builds.
-    # (Ref: helpcenter.veeam.com platform_support ver=13.)
-    try {
-        $os    = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-        $build = [int]($os.BuildNumber)
-
-        # Known Windows Server LTSC build numbers.
-        $ltscBuilds = @{
-            14393 = 'Windows Server 2016 (LTSC)'
-            17763 = 'Windows Server 2019 (LTSC)'
-            20348 = 'Windows Server 2022 (LTSC)'
-            26100 = 'Windows Server 2025 (LTSC)'
-        }
-
-        if ($ltscBuilds.ContainsKey($build)) {
-            Add-AuditResult -Topic 'Components' -RuleName 'OS is a supported LTS/LTSC build' `
-                -Status 'Passed' -CurrentValue ("{0} (build {1})" -f $ltscBuilds[$build], $build) `
-                -Recommendation 'Continue running an LTSC channel OS or Veeam JeOS for backup infrastructure.' | Out-Null
-        }
-        else {
-            Add-AuditResult -Topic 'Components' -RuleName 'OS is a supported LTS/LTSC build' `
-                -Status 'Warning' -CurrentValue ("{0} (build {1}) - not a recognised LTSC build" -f $os.Caption, $build) `
-                -Recommendation 'Backup infrastructure should run an LTSC Windows Server build (2016/2019/2022/2025) or Veeam JeOS, not the Semi-Annual Channel.' | Out-Null
-        }
-    }
-    catch {
-        Add-AuditResult -Topic 'Components' -RuleName 'OS is a supported LTS/LTSC build' `
-            -Status 'Error' -CurrentValue $_.Exception.Message `
-            -Recommendation 'Confirm OS edition/build against the Veeam v13 platform support matrix.' | Out-Null
-    }
-
-    # 1.4 Veeam software version -------------------------------------------------------
-    # Prefer the SDK; fall back to the Core DLL file version, then the registry.
-    # (Ref: veeam.com/kb2680 for the latest v13 build.)
-    try {
-        $installedBuild = $null
-        $source = ''
-
-        # (a) Registry-recorded product version (fast, no session required).
-        $regBuild = Get-RegistryValue -Path 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication' -Name 'CurrentVersion'
-        if ($regBuild) { $installedBuild = "$regBuild"; $source = 'registry' }
-
-        # (b) File version of Veeam.Backup.Core.dll (authoritative build).
-        if (-not $installedBuild) {
-            $corePath = Get-RegistryValue -Path 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication' -Name 'CorePath'
-            if ($corePath) {
-                $coreDll = Join-Path $corePath 'Veeam.Backup.Core.dll'
-                if (Test-Path -LiteralPath $coreDll) {
-                    $installedBuild = (Get-Item -LiteralPath $coreDll).VersionInfo.ProductVersion
-                    $source = 'Veeam.Backup.Core.dll'
-                }
+    # 1.2 OS patched / Veeam Updater configured.
+    Invoke-Item -Num '1.2' -Topic $T -Name 'Are operating systems hosting Veeam components patched and up-to-date, or configured to auto-update using Veeam updater?' `
+        -Recommendation 'Patch the OS within one cycle (<=35 days) and configure the Veeam Updater service/task.' -Check {
+            $hf = Get-HotFix -ErrorAction Stop | Where-Object InstalledOn | Sort-Object InstalledOn -Descending | Select-Object -First 1
+            $days = if ($hf) { (New-TimeSpan -Start $hf.InstalledOn -End (Get-Date)).Days } else { $null }
+            $svc = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'Updater' -and $_.DisplayName -match 'Veeam' })
+            $task = @()
+            if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+                $task = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -match 'Veeam' -and $_.TaskName -match 'Update' })
             }
+            $updater = ($svc.Count -gt 0 -or $task.Count -gt 0)
+            $st = if ($days -ne $null -and $days -le 35 -and $updater) { 'Passed' } elseif ($days -ne $null -and $days -le 35) { 'Warning' } else { 'Failed' }
+            $v = "Last hotfix: {0}; Veeam Updater: {1}" -f `
+                $(if ($hf) { "$($hf.HotFixID) ($days d ago)" } else { 'none dated' }), `
+                $(if ($updater) { 'present' } else { 'absent' })
+            @{ Status = $st; Value = $v }
         }
 
-        if ($installedBuild) {
-            # Compare against the operator-supplied latest known build.
-            $isCurrent = $false
-            try {
-                $installedVer = [version](($installedBuild -split '\s')[0])
-                $latestVer    = [version]$LatestKnownVbrBuild
-                $isCurrent    = $installedVer -ge $latestVer
-            } catch { }
+    # 1.3 LTS / LTSC OS build.
+    Invoke-Item -Num '1.3' -Topic $T -Name 'Are operating systems hosting Veeam components built using LTS / LTSC OS versions (long-term support or service channel) or using Veeam JeOS?' `
+        -Recommendation 'Run an LTSC Windows Server build (2016/2019/2022/2025) or Veeam JeOS for backup infrastructure.' -Check {
+            $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+            $b = [int]$os.BuildNumber
+            $ltsc = @{ 14393 = 'Server 2016'; 17763 = 'Server 2019'; 20348 = 'Server 2022'; 26100 = 'Server 2025' }
+            if ($ltsc.ContainsKey($b)) { @{ Status = 'Passed'; Value = ("{0} LTSC (build {1})" -f $ltsc[$b], $b) } }
+            else { @{ Status = 'Warning'; Value = ("{0} (build {1}) - not a recognised LTSC build" -f $os.Caption, $b) } }
+        }
 
-            Add-AuditResult -Topic 'Components' -RuleName 'Veeam VBR software is on the latest v13 build' `
-                -Status $(if ($isCurrent) { 'Passed' } else { 'Warning' }) `
-                -CurrentValue ("Installed {0} (via {1}); latest known {2}" -f $installedBuild, $source, $LatestKnownVbrBuild) `
-                -Recommendation 'Cross-check the installed build against KB2680 and apply the latest v13 cumulative patch.' | Out-Null
+    # 1.4 Veeam components patched (VBR build vs KB2680).
+    Invoke-Item -Num '1.4' -Topic $T -Name 'Are Veeam components patched and up to date, or configured with auto-update using Veeam updater?' `
+        -Recommendation 'Compare the installed build to KB2680 and apply the latest v13 cumulative patch.' -Check {
+            $build = Get-RegistryValue 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication' 'CurrentVersion'
+            $src = 'registry'
+            if (-not $build) {
+                $core = Get-RegistryValue 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication' 'CorePath'
+                if ($core) { $dll = Join-Path $core 'Veeam.Backup.Core.dll'; if (Test-Path -LiteralPath $dll) { $build = (Get-Item -LiteralPath $dll).VersionInfo.ProductVersion; $src = 'Core.dll' } }
+            }
+            if (-not $build) { return @{ Status = 'Warning'; Value = 'VBR build could not be determined' } }
+            $cur = $false
+            try { $cur = [version](($build -split '\s')[0]) -ge [version]$LatestKnownVbrBuild } catch { }
+            @{ Status = $(if ($cur) { 'Passed' } else { 'Warning' }); Value = ("Installed {0} (via {1}); latest known {2}" -f $build, $src, $LatestKnownVbrBuild) }
         }
-        else {
-            Add-AuditResult -Topic 'Components' -RuleName 'Veeam VBR software is on the latest v13 build' `
-                -Status 'Warning' -CurrentValue 'VBR build could not be determined' `
-                -Recommendation 'Confirm VBR is installed and compare its build to KB2680.' | Out-Null
+
+    # 1.5 Sole tenant (no co-hosted server roles).
+    Invoke-Item -Num '1.5' -Topic $T -Name 'Are Veeam components (including SQL if applicable) sole tenants on the relevant server (i.e. no additional services co-hosted on that instance)' `
+        -Recommendation 'Dedicate the server to Veeam; remove co-hosted roles (IIS, DNS, DHCP, Exchange, Hyper-V, etc.).' -Check {
+            $roles = @{ 'W3SVC' = 'IIS'; 'DNS' = 'DNS'; 'DHCPServer' = 'DHCP'; 'MSExchangeIS' = 'Exchange'; 'vmms' = 'Hyper-V'; 'MSSQLSERVER' = 'SQL(default)' }
+            $found = @()
+            foreach ($k in $roles.Keys) { if (Get-Service -Name $k -ErrorAction SilentlyContinue) { $found += $roles[$k] } }
+            if ($found.Count -eq 0) { @{ Status = 'Passed'; Value = 'No common co-hosted server roles detected' } }
+            else { @{ Status = 'Warning'; Value = ("Co-hosted roles detected: {0}" -f ($found -join ', ')) } }
         }
-    }
-    catch {
-        Add-AuditResult -Topic 'Components' -RuleName 'Veeam VBR software is on the latest v13 build' `
-            -Status 'Error' -CurrentValue $_.Exception.Message `
-            -Recommendation 'Determine VBR build manually and compare to KB2680.' | Out-Null
-    }
+
+    # 1.6 Backup server separated from production authentication domain.
+    Invoke-Item -Num '1.6' -Topic $T -Name 'Is the backup server separated from the production authentication domain (applicable only to Windows OS hosting VBR)?' `
+        -Recommendation 'Host VBR in a workgroup or a dedicated management/backup domain, not the production AD domain.' -Check {
+            $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+            if ($cs.PartOfDomain) { @{ Status = 'Warning'; Value = ("Domain-joined: {0} - confirm this is NOT the production domain" -f $cs.Domain) } }
+            else { @{ Status = 'Passed'; Value = ("Workgroup: {0} (not domain-joined)" -f $cs.Workgroup) } }
+        }
+
+    # 1.7 VBR console within a DMZ - topology, manual.
+    Invoke-Item -Num '1.7' -Topic $T -Name 'Is the VBR console within a DMZ?' `
+        -Recommendation 'Network topology decision - verify console placement against hardening-zone guidance.'
+
+    # 1.8 Inbound/Outbound access restricted (firewall enabled as a proxy signal).
+    Invoke-Item -Num '1.8' -Topic $T -Name 'Is Inbound and Outbound access (e.g. from the internet) to the VBR server restricted to critical services i.e. Veeam Update Notification Server (dev.veeam.com), Veeam License Update Servers (vbr.butler.veeam.com, autolk.veeam.com)?' `
+        -Recommendation 'Restrict inbound/outbound to required Veeam endpoints at the corporate/local firewall.' -Check {
+            if (-not (Get-Command Get-NetFirewallProfile -ErrorAction SilentlyContinue)) { return @{ Status = 'Warning'; Value = 'Firewall cmdlets unavailable' } }
+            $p = Get-NetFirewallProfile -ErrorAction Stop
+            $off = @($p | Where-Object { -not $_.Enabled })
+            if ($off.Count -eq 0) { @{ Status = 'Warning'; Value = 'Windows Firewall enabled on all profiles (confirm egress rules restrict to Veeam endpoints)' } }
+            else { @{ Status = 'Failed'; Value = ("Firewall disabled on profile(s): {0}" -f (($off.Name) -join ', ')) } }
+        }
+
+    # 1.9 Configuration database encrypted (config backup encryption).
+    Invoke-Item -Num '1.9' -Topic $T -Name 'Is the Veeam Configuration database encrypted?' `
+        -Recommendation 'Enable encryption on the configuration backup job (config_backup_encrypted).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name 'Get-VBRConfigurationBackupJob'
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'Get-VBRConfigurationBackupJob unavailable' } }
+            $cfg = & $c -ErrorAction Stop
+            $enc = Get-PropSafe -InputObject (Get-PropSafe -InputObject $cfg -Name @('EncryptionOptions')) -Name @('Enabled', 'IsEnabled')
+            if ($null -eq $enc) { $enc = Get-PropSafe -InputObject $cfg -Name @('EncryptionEnabled') }
+            @{ Status = $(if ($enc -eq $true) { 'Passed' } elseif ($null -eq $enc) { 'Warning' } else { 'Failed' }); Value = ("Config backup encryption={0}" -f (nv $enc)) }
+        }
+
+    # 1.10 Physically secured - manual.
+    Invoke-Item -Num '1.10' -Topic $T -Name 'Are Veeam servers physically secured?' `
+        -Recommendation 'Physical/data-centre control - verify with Facilities Security.'
+
+    # 1.11 Hardware protection (UEFI Secure Boot / TPM).
+    Invoke-Item -Num '1.11' -Topic $T -Name 'Are the Veeam servers hardware-protected e.g. UEFI, TPM?' `
+        -Recommendation 'Enable TPM and UEFI Secure Boot on the backup server hardware.' -Check {
+            $tpm = $null
+            if (Get-Command Get-Tpm -ErrorAction SilentlyContinue) { try { $tpm = (Get-Tpm).TpmPresent } catch { } }
+            $sb = 'unknown'
+            try { $sb = [string](Confirm-SecureBootUEFI) } catch { $sb = 'legacy BIOS / not supported' }
+            $st = if ($tpm -eq $true -and $sb -eq 'True') { 'Passed' } else { 'Warning' }
+            @{ Status = $st; Value = ("TPM present={0}; SecureBoot={1}" -f (nv $tpm), $sb) }
+        }
+
+    # 1.12 Only required ports open - firewall/policy, manual.
+    Invoke-Item -Num '1.12' -Topic $T -Name 'Are only the required ports open and accessible via Firewall?' `
+        -Recommendation 'Review firewall rules against the Veeam used-ports reference; open only required ports.'
+
+    # 1.13 Restrict console/management connectivity - manual.
+    Invoke-Item -Num '1.13' -Topic $T -Name 'Does the VBR server restrict console/management connectivity to just trusted systems?' `
+        -Recommendation 'Restrict management access (firewall / jump host / Kerberos) to trusted admin systems only.'
+
+    # 1.14 Enterprise Manager in DMZ - manual.
+    Invoke-Item -Num '1.14' -Topic $T -Name 'Is Veeam Enterprise Manager deployed in the DMZ?' `
+        -Recommendation 'Topology decision - verify EM placement against hardening-zone guidance.'
+
+    # 1.15 OS-level MFA - manual.
+    Invoke-Item -Num '1.15' -Topic $T -Name 'Are servers hosting the VBR components protected by MFA (OS-level)?' `
+        -Recommendation 'Consult the OS vendor for OS-level MFA best practices.'
+
+    # 1.16 VBR console MFA (SDK probe).
+    Invoke-Item -Num '1.16' -Topic $T -Name 'Is the VBR console protected by MFA?' `
+        -Recommendation 'Enforce MFA for VBR console logon (mfa.html).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name @('Get-VBRMFAConfiguration', 'Get-VBRSecurityMFAPolicy', 'Get-VBRMultiFactorAuthentication')
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'MFA cmdlet unavailable - verify in console' } }
+            $mfa = & $c -ErrorAction Stop
+            $en = Get-PropSafe -InputObject $mfa -Name @('IsEnabled', 'Enabled', 'MfaEnabled')
+            @{ Status = $(if ($en -eq $true) { 'Passed' } elseif ($null -eq $en) { 'Warning' } else { 'Failed' }); Value = ("Console MFA enabled={0}" -f (nv $en)) }
+        }
+
+    # 1.17 Console auto-logoff <=10 min - mostly console-side, manual.
+    Invoke-Item -Num '1.17' -Topic $T -Name 'Is the VBR console configured to auto-logoff after a set period of 10 minutes or less?' `
+        -Recommendation 'Enable auto-logoff (<=10 min) in VBR console security settings.'
+
+    # 1.18 Outdated protocols disabled (SSL 2.0 + SMB 1.0).
+    Invoke-Item -Num '1.18' -Topic $T -Name 'Are outdated protocols, components or services disabled / removed on all Veeam components in accordance with NIST guidelines (e.g. SSL 2.0, SMB 1.0)' `
+        -Recommendation 'Disable SSL 2.0/3.0 in SCHANNEL and remove SMBv1; enforce TLS 1.2+ (NIST SP 800-52r2).' -Check {
+            $smb1 = $null
+            if (Get-Command Get-SmbServerConfiguration -ErrorAction SilentlyContinue) { $smb1 = (Get-SmbServerConfiguration -ErrorAction Stop).EnableSMB1Protocol }
+            $ssl2 = Get-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\SSL 2.0\Server' 'Enabled'
+            $smbOk = ($smb1 -eq $false)
+            $sslOk = ($ssl2 -eq 0 -or $null -eq $ssl2)
+            $st = if ($smbOk -and $sslOk) { 'Passed' } elseif ($smb1 -eq $true) { 'Failed' } else { 'Warning' }
+            @{ Status = $st; Value = ("SMB1={0}; SSL2.0\Server\Enabled={1}" -f (nv $smb1), (nv $ssl2)) }
+        }
+
+    # 1.19 OS session timeout / re-authentication (machine inactivity limit).
+    Invoke-Item -Num '1.19' -Topic $T -Name 'Are OS session timeouts and re-authentication configured for Veeam?' `
+        -Recommendation 'Set an interactive-logon machine inactivity limit (e.g. <=600s) requiring re-authentication.' -Check {
+            $t = Get-RegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'InactivityTimeoutSecs'
+            $st = if ($t -gt 0 -and $t -le 900) { 'Passed' } elseif ($t -gt 0) { 'Warning' } else { 'Failed' }
+            @{ Status = $st; Value = ("InactivityTimeoutSecs={0}" -f (nv $t)) }
+        }
+
+    # 1.20 Anonymized naming (heuristic on hostname).
+    Invoke-Item -Num '1.20' -Topic $T -Name "Are Veeam components 'anonymized' within the infrastructure? E.g. using a non-obvious naming convention" `
+        -Recommendation "Avoid obvious names like 'BackupSrv1', 'Veeam', 'Repo1'." -Check {
+            $n = $env:COMPUTERNAME
+            if ($n -match '(?i)veeam|backup|repo|vbr|veeam') { @{ Status = 'Warning'; Value = ("Hostname '{0}' reveals its role" -f $n) } }
+            else { @{ Status = 'Passed'; Value = ("Hostname '{0}' is non-obvious" -f $n) } }
+        }
+
+    # 1.21 Syslog / SIEM integration (SDK probe).
+    Invoke-Item -Num '1.21' -Topic $T -Name 'Is Veeam configured to send log data to a syslog server for SIEM integration?' `
+        -Recommendation 'Configure a syslog server for SIEM integration.' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name @('Get-VBRSyslogServer', 'Get-VBRSyslogServerInfo')
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'Syslog cmdlet unavailable - verify in console' } }
+            $s = @(& $c -ErrorAction Stop)
+            @{ Status = $(if ($s.Count -gt 0) { 'Passed' } else { 'Failed' }); Value = ("{0} syslog server(s) configured" -f $s.Count) }
+        }
+
+    # 1.22 PKI-based authentication - manual.
+    Invoke-Item -Num '1.22' -Topic $T -Name 'Is PKI-based authentication configured for service accounts and components?' `
+        -Recommendation 'Verify PKI-based authentication configuration.'
+
+    # 1.23 Backup integrity validation after each job (health check).
+    Invoke-Item -Num '1.23' -Topic $T -Name 'Is backup integrity validation performed automatically after each backup job?' `
+        -Recommendation 'Enable automatic health check / integrity validation on backup jobs.' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $jobs = @(Get-Jobs)
+            if ($jobs.Count -eq 0) { return @{ Status = 'Warning'; Value = 'No jobs found' } }
+            $withHc = 0
+            foreach ($j in $jobs) {
+                try {
+                    $o = Get-VBRJobOptions -Job $j -ErrorAction Stop
+                    $gp = Get-PropSafe -InputObject $o -Name @('GenerationPolicy')
+                    $hc = Get-PropSafe -InputObject $gp -Name @('EnableRechek', 'EnableRecheck', 'RecheckBackupEnabled')
+                    if ($hc -eq $true) { $withHc++ }
+                } catch { }
+            }
+            @{ Status = $(if ($withHc -eq $jobs.Count) { 'Passed' } elseif ($withHc -gt 0) { 'Warning' } else { 'Failed' }); Value = ("{0}/{1} jobs have health-check enabled" -f $withHc, $jobs.Count) }
+        }
+
+    # 1.24 CDP configured for critical replicas (SDK probe).
+    Invoke-Item -Num '1.24' -Topic $T -Name 'Is Universal Continuous Data Protection (CDP) configured for critical VM replicas?' `
+        -Recommendation 'Configure CDP policies for critical VM replicas where RPO requires it.' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name @('Get-VBRCDPPolicy', 'Get-VBRCDPReplica')
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'CDP cmdlet unavailable' } }
+            $p = @(& $c -ErrorAction Stop)
+            @{ Status = $(if ($p.Count -gt 0) { 'Passed' } else { 'Warning' }); Value = ("{0} CDP policy/policies configured" -f $p.Count) }
+        }
 }
 
 #endregion
 
-#region ----------------------------------------------------------------------- 2. Windows Build hardening
+#region ----------------------------------------------------------------------- 2. Windows Build
 
 function Invoke-WindowsBuildChecks {
-    Write-Host "`n--- 2. Components - Windows Build (hardening baseline) ---" -ForegroundColor White
+    Write-Host "`n--- 2. Components - Windows Build ---" -ForegroundColor White
+    $T = 'Components - Windows Build'
 
-    # Helper: evaluate a Windows service's start mode against "should be disabled".
-    function Test-ServiceDisabled {
-        param([string]$RuleName, [string]$ServiceName, [string]$Recommendation, [string]$Severity = 'Failed')
-        try {
-            $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-            if (-not $svc) {
-                Add-AuditResult -Topic 'Components - Windows Build' -RuleName $RuleName `
-                    -Status 'Passed' -CurrentValue "Service '$ServiceName' not present" `
-                    -Recommendation $Recommendation | Out-Null
-                return
-            }
-            # StartType Disabled is the compliant state.
-            $startType = (Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'" -ErrorAction Stop).StartMode
-            $isDisabled = $startType -eq 'Disabled'
-            Add-AuditResult -Topic 'Components - Windows Build' -RuleName $RuleName `
-                -Status $(if ($isDisabled) { 'Passed' } else { $Severity }) `
-                -CurrentValue ("StartMode={0}; Status={1}" -f $startType, $svc.Status) `
-                -Recommendation $Recommendation | Out-Null
+    # 2.1 Malignant process/service detection - AV presence heuristic.
+    Invoke-Item -Num '2.1' -Topic $T -Name 'Is there a process in place for malignant process/service detection?' `
+        -Recommendation 'Deploy anti-malware / process monitoring (e.g. Defender + Sysinternals Procmon).' -Check {
+            if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) {
+                $mp = Get-MpComputerStatus -ErrorAction Stop
+                @{ Status = $(if ($mp.RealTimeProtectionEnabled) { 'Passed' } else { 'Warning' }); Value = ("Defender real-time protection={0}" -f $mp.RealTimeProtectionEnabled) }
+            } else { @{ Status = 'Warning'; Value = 'Defender status cmdlet unavailable - verify third-party AV' } }
         }
-        catch {
-            Add-AuditResult -Topic 'Components - Windows Build' -RuleName $RuleName `
-                -Status 'Error' -CurrentValue $_.Exception.Message -Recommendation $Recommendation | Out-Null
+
+    # 2.2 Guest interaction proxy instead of VBR server - SDK, manual-ish.
+    Invoke-Item -Num '2.2' -Topic $T -Name 'Are you using guest interaction proxy instead of VBR server for application awareness ?' `
+        -Recommendation 'Use dedicated guest interaction proxies rather than the VBR server for guest processing.'
+
+    # 2.3 Config DB backup stored separately (SDK target vs local).
+    Invoke-Item -Num '2.3' -Topic $T -Name 'Is the Veeam configuration database backup stored separately from the VBR server (non-appliance)?' `
+        -Recommendation 'Target the configuration backup at a repository that is not local to the VBR server.' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name 'Get-VBRConfigurationBackupJob'
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'Config backup cmdlet unavailable' } }
+            $cfg = & $c -ErrorAction Stop
+            $target = Get-PropSafe -InputObject $cfg -Name @('Target', 'RepositoryName', 'Repository')
+            @{ Status = 'Warning'; Value = ("Config backup target: {0} - confirm it is off the VBR host" -f (nv $target)) }
         }
-    }
 
-    # 2.1 Remote Registry service disabled (Required).
-    Test-ServiceDisabled -RuleName 'Remote Registry (RemoteRegistry) disabled' `
-        -ServiceName 'RemoteRegistry' `
-        -Recommendation 'Disable the Remote Registry service on VBR components (Veeam Cyber Secure registry hardening).' -Severity 'Failed'
+    # 2.4 - 2.11 registry / service hardening.
+    Invoke-Item -Num '2.4' -Topic $T -Name 'Remote Registry service (RemoteRegistry) should be disabled' `
+        -Recommendation 'Disable the Remote Registry service.' -Check { Test-SvcDisabled -Name 'RemoteRegistry' -Severity 'Failed' }
 
-    # 2.2 WinRM disabled (Advised).
-    Test-ServiceDisabled -RuleName 'Windows Remote Management (WinRM) disabled' `
-        -ServiceName 'WinRM' `
-        -Recommendation 'Disable WinRM on backup infrastructure unless explicitly required for management.' -Severity 'Warning'
+    Invoke-Item -Num '2.5' -Topic $T -Name 'Windows Remote Management (WinRM) service should be disabled' `
+        -Recommendation 'Disable WinRM unless explicitly required.' -Check { Test-SvcDisabled -Name 'WinRM' -Severity 'Warning' }
 
-    # 2.3 WPAD / Web Proxy Auto-Discovery disabled (Advised).
-    Test-ServiceDisabled -RuleName 'Web Proxy Auto-Discovery (WinHttpAutoProxySvc) disabled' `
-        -ServiceName 'WinHttpAutoProxySvc' `
-        -Recommendation 'Disable the WPAD service to prevent proxy hijacking attacks.' -Severity 'Warning'
-
-    # 2.4 WDigest credential caching disabled (Advised).
-    # UseLogonCredential must be 0 (Win2016+ default) so plaintext creds are not cached.
-    try {
-        $wdigest = Get-RegistryValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' -Name 'UseLogonCredential'
-        $compliant = ($wdigest -eq 0) -or ($null -eq $wdigest)  # absent = secure default on modern OS
-        Add-AuditResult -Topic 'Components - Windows Build' -RuleName 'WDigest credential caching disabled' `
-            -Status $(if ($compliant) { 'Passed' } else { 'Warning' }) `
-            -CurrentValue ("UseLogonCredential={0}" -f $(if ($null -eq $wdigest) { 'not set (secure default)' } else { $wdigest })) `
-            -Recommendation 'Explicitly set WDigest\UseLogonCredential=0 to prevent plaintext credential caching in LSASS.' | Out-Null
-    }
-    catch {
-        Add-AuditResult -Topic 'Components - Windows Build' -RuleName 'WDigest credential caching disabled' `
-            -Status 'Error' -CurrentValue $_.Exception.Message -Recommendation 'Verify WDigest hardening manually.' | Out-Null
-    }
-
-    # 2.5 Windows Script Host disabled (Advised).
-    try {
-        $wsh = Get-RegistryValue -Path 'HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings' -Name 'Enabled'
-        Add-AuditResult -Topic 'Components - Windows Build' -RuleName 'Windows Script Host disabled' `
-            -Status $(if ($wsh -eq 0) { 'Passed' } else { 'Warning' }) `
-            -CurrentValue ("WSH Enabled={0}" -f $(if ($null -eq $wsh) { 'not set (enabled)' } else { $wsh })) `
-            -Recommendation 'Set Windows Script Host\Settings\Enabled=0 to block .vbs/.js execution vectors.' | Out-Null
-    }
-    catch {
-        Add-AuditResult -Topic 'Components - Windows Build' -RuleName 'Windows Script Host disabled' `
-            -Status 'Error' -CurrentValue $_.Exception.Message -Recommendation 'Verify WSH hardening manually.' | Out-Null
-    }
-
-    # 2.6 LLMNR disabled (Advised).
-    try {
-        $llmnr = Get-RegistryValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -Name 'EnableMulticast'
-        Add-AuditResult -Topic 'Components - Windows Build' -RuleName 'Link-Local Multicast Name Resolution (LLMNR) disabled' `
-            -Status $(if ($llmnr -eq 0) { 'Passed' } else { 'Warning' }) `
-            -CurrentValue ("DNSClient\EnableMulticast={0}" -f $(if ($null -eq $llmnr) { 'not set (LLMNR enabled)' } else { $llmnr })) `
-            -Recommendation 'Set DNSClient\EnableMulticast=0 (GPO) to disable LLMNR and reduce name-poisoning risk.' | Out-Null
-    }
-    catch {
-        Add-AuditResult -Topic 'Components - Windows Build' -RuleName 'Link-Local Multicast Name Resolution (LLMNR) disabled' `
-            -Status 'Error' -CurrentValue $_.Exception.Message -Recommendation 'Verify LLMNR hardening manually.' | Out-Null
-    }
-
-    # 2.7 SMBv1 disabled (Required - NIST outdated-protocol guidance).
-    try {
-        $smb1 = $null
-        if (Get-Command -Name Get-SmbServerConfiguration -ErrorAction SilentlyContinue) {
-            $smb1 = (Get-SmbServerConfiguration -ErrorAction Stop).EnableSMB1Protocol
+    Invoke-Item -Num '2.6' -Topic $T -Name 'WDigest credentials caching should be disabled' `
+        -Recommendation 'Set WDigest\UseLogonCredential=0 to prevent plaintext credential caching.' -Check {
+            $w = Get-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' 'UseLogonCredential'
+            @{ Status = $(if ($w -eq 0 -or $null -eq $w) { 'Passed' } else { 'Warning' }); Value = ("UseLogonCredential={0}" -f $(if ($null -eq $w) { 'not set (secure default)' } else { $w })) }
         }
-        if ($null -ne $smb1) {
-            Add-AuditResult -Topic 'Components - Windows Build' -RuleName 'SMB 1.0 protocol disabled' `
-                -Status $(if (-not $smb1) { 'Passed' } else { 'Failed' }) `
-                -CurrentValue ("EnableSMB1Protocol={0}" -f $smb1) `
-                -Recommendation 'Disable SMBv1 (Set-SmbServerConfiguration -EnableSMB1Protocol $false) per NIST outdated-protocol guidance.' | Out-Null
-        }
-        else {
-            Add-AuditResult -Topic 'Components - Windows Build' -RuleName 'SMB 1.0 protocol disabled' `
-                -Status 'Warning' -CurrentValue 'Unable to query SMB server configuration' `
-                -Recommendation 'Confirm SMBv1 is removed / disabled.' | Out-Null
-        }
-    }
-    catch {
-        Add-AuditResult -Topic 'Components - Windows Build' -RuleName 'SMB 1.0 protocol disabled' `
-            -Status 'Error' -CurrentValue $_.Exception.Message -Recommendation 'Verify SMBv1 status manually.' | Out-Null
-    }
 
-    # 2.8 SSL 2.0 disabled (Required - NIST SP 800-52r2).
-    try {
-        $ssl2Server = Get-RegistryValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\SSL 2.0\Server' -Name 'Enabled'
-        # 0 (or 0xFFFFFFFF disabled semantics) = disabled. Absent = OS default (disabled on modern Server).
-        $ssl2Disabled = ($ssl2Server -eq 0)
-        Add-AuditResult -Topic 'Components - Windows Build' -RuleName 'SSL 2.0 protocol disabled' `
-            -Status $(if ($ssl2Disabled) { 'Passed' } else { 'Warning' }) `
-            -CurrentValue ("SCHANNEL SSL 2.0\Server\Enabled={0}" -f $(if ($null -eq $ssl2Server) { 'not set (default)' } else { $ssl2Server })) `
-            -Recommendation 'Explicitly disable SSL 2.0/3.0 in SCHANNEL and enforce TLS 1.2+ per NIST SP 800-52r2.' | Out-Null
-    }
-    catch {
-        Add-AuditResult -Topic 'Components - Windows Build' -RuleName 'SSL 2.0 protocol disabled' `
-            -Status 'Error' -CurrentValue $_.Exception.Message -Recommendation 'Verify SCHANNEL protocol hardening manually.' | Out-Null
-    }
+    Invoke-Item -Num '2.7' -Topic $T -Name 'Web Proxy Auto-Discovery service (WinHttpAutoProxySvc) should be disabled' `
+        -Recommendation 'Disable the WPAD service to prevent proxy hijacking.' -Check { Test-SvcDisabled -Name 'WinHttpAutoProxySvc' -Severity 'Warning' }
 
-    # 2.9 RDP disabled on the VBR server (Required).
-    # fDenyTSConnections = 1 means RDP is denied (compliant for a hardened backup server).
-    try {
-        $denyRdp = Get-RegistryValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections'
-        Add-AuditResult -Topic 'Components - Windows Build' -RuleName 'RDP disabled on the VBR server' `
-            -Status $(if ($denyRdp -eq 1) { 'Passed' } else { 'Failed' }) `
-            -CurrentValue ("fDenyTSConnections={0}" -f $(if ($null -eq $denyRdp) { 'not set (RDP allowed)' } else { $denyRdp })) `
-            -Recommendation 'Set fDenyTSConnections=1 to disable RDP on the backup server; use console/jump-host access only.' | Out-Null
-    }
-    catch {
-        Add-AuditResult -Topic 'Components - Windows Build' -RuleName 'RDP disabled on the VBR server' `
-            -Status 'Error' -CurrentValue $_.Exception.Message -Recommendation 'Verify RDP is disabled manually.' | Out-Null
-    }
+    Invoke-Item -Num '2.8' -Topic $T -Name 'Is anti-malware / anti-virus software in place with the necessary exclusions for Veeam functions?' `
+        -Recommendation 'Install AV with Veeam exclusions per KB1999.' -Check {
+            if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) {
+                $mp = Get-MpComputerStatus -ErrorAction Stop
+                @{ Status = $(if ($mp.AntivirusEnabled) { 'Passed' } else { 'Warning' }); Value = ("AV enabled={0}; AM service running={1} (confirm KB1999 exclusions)" -f $mp.AntivirusEnabled, $mp.AMServiceEnabled) }
+            } else { @{ Status = 'Warning'; Value = 'Defender status unavailable - verify third-party AV + exclusions' } }
+        }
+
+    Invoke-Item -Num '2.9' -Topic $T -Name 'Is RDP disabled on the Veeam Backup and Replication server?' `
+        -Recommendation 'Set fDenyTSConnections=1 to disable RDP; use console/jump-host access.' -Check {
+            $d = Get-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections'
+            @{ Status = $(if ($d -eq 1) { 'Passed' } else { 'Failed' }); Value = ("fDenyTSConnections={0}" -f $(if ($null -eq $d) { 'not set (RDP allowed)' } else { $d })) }
+        }
+
+    Invoke-Item -Num '2.10' -Topic $T -Name 'Windows Script Host should be disabled' `
+        -Recommendation 'Set Windows Script Host\Settings\Enabled=0.' -Check {
+            $s = Get-RegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings' 'Enabled'
+            @{ Status = $(if ($s -eq 0) { 'Passed' } else { 'Warning' }); Value = ("WSH Enabled={0}" -f $(if ($null -eq $s) { 'not set (enabled)' } else { $s })) }
+        }
+
+    Invoke-Item -Num '2.11' -Topic $T -Name 'Link-Local Multicast Name Resolution (LLMNR) should be disabled' `
+        -Recommendation 'Set DNSClient\EnableMulticast=0 (GPO) to disable LLMNR.' -Check {
+            $l = Get-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'EnableMulticast'
+            @{ Status = $(if ($l -eq 0) { 'Passed' } else { 'Warning' }); Value = ("EnableMulticast={0}" -f $(if ($null -eq $l) { 'not set (LLMNR enabled)' } else { $l })) }
+        }
 }
 
 #endregion
 
-#region ----------------------------------------------------------------------- 3. Repositories
+#region ----------------------------------------------------------------------- 3. VSA Build (Linux appliance)
+
+function Invoke-VsaBuildChecks {
+    Write-Host "`n--- 3. Components - VSA Build (Linux appliance) ---" -ForegroundColor White
+    $T = 'Components - VSA Build'
+    # The Veeam Software Appliance is a hardened Linux (JeOS) appliance; these items cannot
+    # be verified from a Windows PowerShell host. They are surfaced as Manual with guidance.
+    $vsa = @(
+        @('3.1', 'Are you using Veeam Integrated Appliance (VIA) for infrastructure components?', 'Verify appliance deployment model (hmc.html).'),
+        @('3.2', 'Are you using Veeam Software Appliance (VSA) with pre-hardened Linux JeOS configuration following DISA STIG standards?', 'Verify DISA STIG-hardened JeOS deployment on the VSA.'),
+        @('3.3', 'Is the VSA configured with services running under low-privilege accounts (non-root)?', 'Verify VSA services run under non-root accounts.'),
+        @('3.4', 'Are VSA automatic security updates enabled for continuous patch management?', 'Enable VSA automatic security updates (em_update_linux.html).'),
+        @('3.5', 'Is Lockdown Mode enabled on VSA to prevent unauthorized software installation?', 'Enable Lockdown Mode on the VSA.'),
+        @('3.6', 'Is SSH access disabled on VSA in production environments?', 'Disable SSH on the VSA in production.'),
+        @('3.7', 'Is high availability clustering configured for backup infrastructure resilience?', 'Configure HA clustering where licensed.'),
+        @('3.8', 'Are Linux hosts and repositories manually verified for authentication?', 'Manually verify Linux host/repository authentication.'),
+        @('3.9', 'Is SSH protected with 2FA/MFA or disabled post-deployment?', 'Protect SSH with MFA or disable it post-deployment.')
+    )
+    foreach ($i in $vsa) { Invoke-Item -Num $i[0] -Topic $T -Name $i[1] -Recommendation ("VSA/Linux appliance item - " + $i[2]) }
+}
+
+#endregion
+
+#region ----------------------------------------------------------------------- 4. Repositories
 
 function Invoke-RepositoryChecks {
-    Write-Host "`n--- 3. Repositories (immutability / hardened) ---" -ForegroundColor White
+    Write-Host "`n--- 4. Repositories ---" -ForegroundColor White
+    $T = 'Repositories'
 
-    if (-not $script:VbrConnected) {
-        Add-AuditResult -Topic 'Repositories' -RuleName 'Hardened / immutable repository configuration' `
-            -Status 'Warning' -CurrentValue 'No VBR session' `
-            -Recommendation 'Establish a VBR connection to enumerate repositories (Get-VBRBackupRepository).' | Out-Null
-        return
-    }
-
-    try {
-        # Get-VBRBackupRepository returns each backup repository object. Immutability and
-        # hardening surface on the object under a few property names depending on repo
-        # type (Linux hardened repo vs object storage). We probe defensively.
-        $repos = @(Get-VBRBackupRepository -ErrorAction Stop)
-
-        # Include object storage repositories (S3/Azure/etc.) if the cmdlet exists.
-        $objCmd = Test-VeeamCmdlet -Name 'Get-VBRObjectStorageRepository'
-        if ($objCmd) {
-            $repos += @(& $objCmd -ErrorAction SilentlyContinue)
+    # 4.1 Object Lock immutability on cloud (object) repositories.
+    Invoke-Item -Num '4.1' -Topic $T -Name 'Is Object Lock immutability enabled for any cloud (object) repositories? (S3, Azure, Google, & IBM)' `
+        -Recommendation 'Enable Object Lock (Compliance mode) on cloud object repositories.' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $oc = Test-VeeamCmdlet -Name 'Get-VBRObjectStorageRepository'
+            if (-not $oc) { return @{ Status = 'Warning'; Value = 'Object storage cmdlet unavailable' } }
+            $obj = @(& $oc -ErrorAction Stop)
+            if ($obj.Count -eq 0) { return @{ Status = 'Manual'; Value = 'No cloud object repositories configured' } }
+            $imm = @($obj | Where-Object { (Get-PropSafe -InputObject $_ -Name @('IsImmutabilityEnabled', 'ImmutabilityEnabled', 'BackupImmutabilityEnabled')) -eq $true })
+            @{ Status = $(if ($imm.Count -eq $obj.Count) { 'Passed' } elseif ($imm.Count -gt 0) { 'Warning' } else { 'Failed' }); Value = ("{0}/{1} object repos immutable" -f $imm.Count, $obj.Count) }
         }
 
-        if (-not $repos -or $repos.Count -eq 0) {
-            Add-AuditResult -Topic 'Repositories' -RuleName 'At least one immutable / hardened repository' `
-                -Status 'Failed' -CurrentValue 'No repositories configured' `
-                -Recommendation 'Configure at least one hardened Linux (XFS) or immutable object-lock repository.' | Out-Null
-            return
+    # 4.2 Repository separated from production auth domain - manual.
+    Invoke-Item -Num '4.2' -Topic $T -Name 'Is the backup repository separated from the production authentication domain?' `
+        -Recommendation 'Use certificate-based/local auth; keep the repository out of the production AD domain.'
+
+    # 4.3 Repository hardened.
+    Invoke-Item -Num '4.3' -Topic $T -Name 'Is the Repository Hardened as per Veeam or manufacturers instructions?' `
+        -Recommendation 'Deploy a hardened repository (Linux XFS single-use creds / immutability).' -Check {
+            $repos = @(Get-Repos)
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            if ($repos.Count -eq 0) { return @{ Status = 'Failed'; Value = 'No repositories configured' } }
+            $hard = @($repos | Where-Object { (Get-PropSafe -InputObject $_ -Name @('IsHardened', 'UseHardenedRepository')) -eq $true -or (Get-PropSafe -InputObject $_ -Name @('IsImmutabilityEnabled', 'ImmutabilityEnabled')) -eq $true })
+            @{ Status = $(if ($hard.Count -gt 0) { 'Passed' } else { 'Warning' }); Value = ("{0}/{1} repositories hardened/immutable" -f $hard.Count, $repos.Count) }
         }
 
-        $immutableCount = 0
-        foreach ($repo in $repos) {
-            # Immutability flag candidates across repo types / builds.
-            $isImmutable = Get-PropSafe -InputObject $repo -Name @(
-                'IsImmutabilityEnabled', 'ImmutabilityEnabled', 'IsImmutable', 'BackupImmutabilityEnabled'
-            )
-            # Immutability retention (days) if exposed.
-            $immutableDays = Get-PropSafe -InputObject $repo -Name @(
-                'ImmutabilityPeriod', 'ImmutabilityDays', 'ImmutabilityInterval'
-            )
-            # Hardened-repo indicator (Linux single-use credentials / XFS fast clone).
-            $isHardened = Get-PropSafe -InputObject $repo -Name @('IsHardened', 'UseHardenedRepository')
-
-            $repoName = Get-PropSafe -InputObject $repo -Name @('Name', 'FriendlyName')
-            $repoType = Get-PropSafe -InputObject $repo -Name @('Type', 'TypeDisplay')
-
-            $immutableTrue = ($isImmutable -eq $true)
-            if ($immutableTrue) { $immutableCount++ }
-
-            $detail = "Type={0}; Immutable={1}{2}{3}" -f `
-                $repoType, `
-                $(if ($null -eq $isImmutable) { 'unknown' } else { $isImmutable }), `
-                $(if ($immutableDays) { "; Period=$immutableDays" } else { '' }), `
-                $(if ($isHardened -eq $true) { '; Hardened=True' } else { '' })
-
-            Add-AuditResult -Topic 'Repositories' -RuleName ("Repository immutability: {0}" -f $repoName) `
-                -Status $(if ($immutableTrue) { 'Passed' } else { 'Warning' }) `
-                -CurrentValue $detail `
-                -Recommendation 'Enable immutability (hardened XFS repo or object-lock in Compliance mode) on production repositories.' | Out-Null
+    # 4.4 At least one repository immutable.
+    Invoke-Item -Num '4.4' -Topic $T -Name 'Is at least one Repository Immutable?' `
+        -Recommendation 'Maintain at least one immutable repository (3-2-1-1-0).' -Check {
+            $repos = @(Get-Repos)
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            if ($repos.Count -eq 0) { return @{ Status = 'Failed'; Value = 'No repositories configured' } }
+            $imm = @($repos | Where-Object { (Get-PropSafe -InputObject $_ -Name @('IsImmutabilityEnabled', 'ImmutabilityEnabled', 'IsImmutable', 'BackupImmutabilityEnabled')) -eq $true })
+            @{ Status = $(if ($imm.Count -ge 1) { 'Passed' } else { 'Failed' }); Value = ("{0}/{1} repositories immutable" -f $imm.Count, $repos.Count) }
         }
 
-        # Roll-up: the checklist requires at least one immutable repository.
-        Add-AuditResult -Topic 'Repositories' -RuleName 'At least one immutable repository present' `
-            -Status $(if ($immutableCount -ge 1) { 'Passed' } else { 'Failed' }) `
-            -CurrentValue ("{0} of {1} repositories immutable" -f $immutableCount, $repos.Count) `
-            -Recommendation 'Maintain at least one immutable copy (3-2-1-1-0). Prefer S3 Object Lock Compliance mode or a hardened Linux repository.' | Out-Null
-    }
-    catch {
-        Add-AuditResult -Topic 'Repositories' -RuleName 'Hardened / immutable repository configuration' `
-            -Status 'Error' -CurrentValue $_.Exception.Message `
-            -Recommendation 'Verify repository immutability via the VBR console.' | Out-Null
-    }
+    # 4.5 - 4.8 storage / VM placement - manual.
+    Invoke-Item -Num '4.5' -Topic $T -Name 'Is the storage (e.g. SAN) hosting the Repository secured?' -Recommendation 'Verify SAN security per storage policy.'
+    Invoke-Item -Num '4.6' -Topic $T -Name 'Is the storage (e.g. SAN) hosting the Repository isolated?' -Recommendation 'Verify SAN isolation (zoning / limited access).'
+    Invoke-Item -Num '4.7' -Topic $T -Name 'Is the storage (e.g. SAN) hosting the Repository used only for Veeam backup data?' -Recommendation 'Dedicate repository storage to Veeam backup data only.'
+    Invoke-Item -Num '4.8' -Topic $T -Name 'Is the Repository NOT a Virtual Machine?' -Recommendation 'Prefer a physical hardened repository over a VM.'
+
+    # 4.9 Linux repos single-use creds + SSH key - manual/semi.
+    Invoke-Item -Num '4.9' -Topic $T -Name 'Do Linux repositories use Single Use Credential Accounts and SSH Private/Public Key with Passphrase?' `
+        -Recommendation 'Use single-use credentials and SSH key + passphrase for Linux repositories.'
+
+    # 4.10 Time services reliable (W32Time + source).
+    Invoke-Item -Num '4.10' -Topic $T -Name 'Are time services reliable?' `
+        -Recommendation 'Ensure W32Time is running and synced to a reliable NTP source (not local CMOS).' -Check {
+            $svc = Get-Service -Name 'W32Time' -ErrorAction SilentlyContinue
+            $source = ''
+            try { $source = (& w32tm.exe /query /source 2>$null) -join '' } catch { }
+            $ok = ($svc -and $svc.Status -eq 'Running' -and $source -and $source -notmatch 'Local CMOS Clock|Free-running')
+            @{ Status = $(if ($ok) { 'Passed' } else { 'Warning' }); Value = ("W32Time={0}; Source={1}" -f $(if ($svc) { $svc.Status } else { 'absent' }), $(if ($source) { $source } else { 'unknown' })) }
+        }
+
+    # 4.11 Time services secure - manual.
+    Invoke-Item -Num '4.11' -Topic $T -Name 'Are time services secure?' -Recommendation 'Verify NTP resilience / authentication / monitoring per policy.'
+
+    # 4.12 IPMI/iDRAC disabled or isolated - manual.
+    Invoke-Item -Num '4.12' -Topic $T -Name 'Are IPMI / iDRAC (or similar) services disabled or isolated on the Repository post-deployment?' `
+        -Recommendation 'Disable or isolate out-of-band management (IPMI/iDRAC) on repositories.'
+
+    # 4.13 Multiple copies of backup data (backup copy jobs).
+    Invoke-Item -Num '4.13' -Topic $T -Name 'Are there multiple copies of backup data?' `
+        -Recommendation 'Maintain multiple copies via backup copy jobs (3-2-1).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name @('Get-VBRBackupCopyJob')
+            $bc = if ($c) { @(& $c -ErrorAction SilentlyContinue) } else { @(Get-Jobs | Where-Object { (Get-PropSafe -InputObject $_ -Name @('JobType')) -match 'BackupSync|Copy' }) }
+            @{ Status = $(if ($bc.Count -gt 0) { 'Passed' } else { 'Warning' }); Value = ("{0} backup copy job(s) configured" -f $bc.Count) }
+        }
+
+    # 4.14 Offsite copy - manual/semi.
+    Invoke-Item -Num '4.14' -Topic $T -Name 'Is there a copy of backup data in an offsite location' `
+        -Recommendation 'Ensure at least one copy is off-site (backup copy / capacity tier).'
+
+    # 4.15 Object lock for Capacity Tier (SOBR).
+    Invoke-Item -Num '4.15' -Topic $T -Name 'Is object lock (immutability) enabled for offloads to Capacity Tier when used?' `
+        -Recommendation 'Enable immutability on the SOBR Capacity Tier object storage.' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name @('Get-VBRScaleOutBackupRepository')
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'SOBR cmdlet unavailable' } }
+            $sobr = @(& $c -ErrorAction Stop)
+            if ($sobr.Count -eq 0) { return @{ Status = 'Manual'; Value = 'No scale-out repositories / capacity tier configured' } }
+            @{ Status = 'Warning'; Value = ("{0} SOBR(s) present - verify capacity-tier object lock in console" -f $sobr.Count) }
+        }
+
+    # 4.16 Object lock for Archive Tier - manual/semi.
+    Invoke-Item -Num '4.16' -Topic $T -Name 'Is object lock (immutability) enabled for offloads to Archive Tier when used?' `
+        -Recommendation 'Enable immutability on the SOBR Archive Tier when used.'
+
+    # 4.17 S3 Object Lock Compliance mode (vs Governance) - manual/semi.
+    Invoke-Item -Num '4.17' -Topic $T -Name "Where applicable, is S3 Object Lock configured to use 'Compliance' mode rather than 'Governance' mode?" `
+        -Recommendation "Use S3 Object Lock 'Compliance' mode, not 'Governance'."
+
+    # 4.18 Built-in immutability for Linux repositories.
+    Invoke-Item -Num '4.18' -Topic $T -Name 'Is built-in repository immutability enabled if Linux-based backup repositories are in use?' `
+        -Recommendation 'Enable built-in immutability on Linux (XFS) repositories.' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $repos = @(Get-Repos | Where-Object { (Get-PropSafe -InputObject $_ -Name @('Type', 'TypeDisplay')) -match 'Linux|Hardened' })
+            if ($repos.Count -eq 0) { return @{ Status = 'Manual'; Value = 'No Linux/hardened repositories detected' } }
+            $imm = @($repos | Where-Object { (Get-PropSafe -InputObject $_ -Name @('IsImmutabilityEnabled', 'ImmutabilityEnabled')) -eq $true })
+            @{ Status = $(if ($imm.Count -eq $repos.Count) { 'Passed' } elseif ($imm.Count -gt 0) { 'Warning' } else { 'Failed' }); Value = ("{0}/{1} Linux repos immutable" -f $imm.Count, $repos.Count) }
+        }
 }
 
 #endregion
 
-#region ----------------------------------------------------------------------- 4. Accounts & Permissions
+#region ----------------------------------------------------------------------- 5. Accounts & Permissions
 
 function Invoke-AccountChecks {
-    Write-Host "`n--- 4. Accounts and Permissions ---" -ForegroundColor White
+    Write-Host "`n--- 5. Accounts and Permissions ---" -ForegroundColor White
+    $T = 'Accounts and Permissions'
 
-    # 4.1 Local Administrators least-privilege review ----------------------------------
-    try {
-        $admins = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction Stop)
-        $names  = $admins | ForEach-Object { $_.Name }
-        # Flag domain (non-local) principals - highlighted for least-privilege review.
-        $domainMembers = @($admins | Where-Object { $_.PrincipalSource -eq 'ActiveDirectory' })
+    Invoke-Item -Num '5.1' -Topic $T -Name 'Is Single Sign-On (SSO) configured using SAML 2.0 or OAuth 2.0?' -Recommendation 'Configure SSO (SAML/OAuth) where applicable (VSPC/EM).'
 
-        # Isolated backup servers should have a minimal, mostly-local admin footprint.
-        $status = if ($domainMembers.Count -eq 0 -and $admins.Count -le 3) {
-            'Passed'
-        } elseif ($domainMembers.Count -gt 0) {
-            'Warning'
-        } else {
-            'Warning'
+    Invoke-Item -Num '5.2' -Topic $T -Name 'Is Multi-Factor Authentication (MFA) mandatory for all user accounts accessing Veeam console?' `
+        -Recommendation 'Make MFA mandatory for all console users.' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name @('Get-VBRMFAConfiguration', 'Get-VBRSecurityMFAPolicy')
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'MFA cmdlet unavailable' } }
+            $en = Get-PropSafe -InputObject (& $c -ErrorAction Stop) -Name @('IsEnabled', 'Enabled', 'MfaEnabled')
+            @{ Status = $(if ($en -eq $true) { 'Passed' } elseif ($null -eq $en) { 'Warning' } else { 'Failed' }); Value = ("MFA enabled={0}" -f (nv $en)) }
         }
 
-        Add-AuditResult -Topic 'Accounts and Permissions' -RuleName 'Local Administrators group follows least privilege' `
-            -Status $status `
-            -CurrentValue ("{0} member(s): {1}{2}" -f $admins.Count, ($names -join ', '), `
-                $(if ($domainMembers) { " | Domain members: " + (($domainMembers.Name) -join ', ') } else { '' })) `
-            -Recommendation 'Remove high-privilege domain accounts from the local Administrators group; use restricted local / managed service accounts for VBR.' | Out-Null
-    }
-    catch {
-        Add-AuditResult -Topic 'Accounts and Permissions' -RuleName 'Local Administrators group follows least privilege' `
-            -Status 'Error' -CurrentValue $_.Exception.Message `
-            -Recommendation 'Review local Administrators membership manually.' | Out-Null
-    }
-
-    # 4.2 Veeam RBAC / security roles --------------------------------------------------
-    if (-not $script:VbrConnected) {
-        Add-AuditResult -Topic 'Accounts and Permissions' -RuleName 'Veeam RBAC roles follow least privilege' `
-            -Status 'Warning' -CurrentValue 'No VBR session' `
-            -Recommendation 'Establish a VBR connection to enumerate RBAC roles.' | Out-Null
-        return
-    }
-
-    try {
-        # Get-VBRSecurityRole (per the checklist) enumerates the RBAC roles defined in VBR.
-        # Cmdlet naming drifts across builds, so resolve from a candidate list.
-        $roleCmd = Test-VeeamCmdlet -Name @('Get-VBRSecurityRole', 'Get-VBRRbacRole', 'Get-VBRUserRoleMapping')
-        if (-not $roleCmd) {
-            Add-AuditResult -Topic 'Accounts and Permissions' -RuleName 'Veeam RBAC roles follow least privilege' `
-                -Status 'Warning' -CurrentValue 'No RBAC cmdlet available in this build' `
-                -Recommendation 'Review Users and Roles in the VBR console (Users_and_Roles).' | Out-Null
-            return
+    Invoke-Item -Num '5.3' -Topic $T -Name 'Is the Security Officer role configured and assigned for four-eyes authorization on critical operations?' `
+        -Recommendation 'Configure and assign the Security Officer role (jeos_install_security_officer).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name @('Get-VBRSecurityOfficer', 'Get-VBRFourEyesAuthorization')
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'Security Officer cmdlet unavailable' } }
+            $so = @(& $c -ErrorAction Stop)
+            @{ Status = $(if ($so.Count -gt 0) { 'Passed' } else { 'Warning' }); Value = ("Security Officer configured: {0}" -f ($so.Count -gt 0)) }
         }
 
-        $roles = @(& $roleCmd -ErrorAction Stop)
+    Invoke-Item -Num '5.4' -Topic $T -Name 'Is there a distinction between user accounts for day-to-day operation, and admin/configuration access to the backup server and infrastructure?' -Recommendation 'Separate day-to-day and admin/config accounts.'
+    Invoke-Item -Num '5.5' -Topic $T -Name 'The backup and restore services accounts are different from the Veeam managed servers account' -Recommendation 'Use distinct service accounts (least privilege).'
+    Invoke-Item -Num '5.6' -Topic $T -Name 'Is the security officer role defined and secured?' -Recommendation 'Define and secure the Security Officer role.'
+    Invoke-Item -Num '5.7' -Topic $T -Name 'Does each relevant user have their own Veeam administrative account' -Recommendation 'Give each admin an individual account (no shared accounts).'
 
-        # Also enumerate explicit user/role assignments where available.
-        $assignCmd = Test-VeeamCmdlet -Name @('Get-VBRUserRoleAssignment', 'Get-VBRRbacRoleAssignment')
-        $assignments = if ($assignCmd) { @(& $assignCmd -ErrorAction SilentlyContinue) } else { @() }
-
-        # Highlight any assignment that maps a principal to the Administrator role - these
-        # deserve scrutiny under least privilege.
-        $adminAssignments = @($assignments | Where-Object {
-            (Get-PropSafe -InputObject $_ -Name @('Role', 'RoleName')) -match 'Administrator'
-        })
-
-        $roleNames = $roles | ForEach-Object { Get-PropSafe -InputObject $_ -Name @('Name', 'RoleName', 'DisplayName') }
-        $assignSummary = $assignments | ForEach-Object {
-            "{0}->{1}" -f (Get-PropSafe -InputObject $_ -Name @('AccountName', 'Name', 'Account')),
-                          (Get-PropSafe -InputObject $_ -Name @('Role', 'RoleName'))
+    Invoke-Item -Num '5.8' -Topic $T -Name 'Are separate backup and restore operators defined?' `
+        -Recommendation 'Define separate Backup and Restore Operator roles.' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name @('Get-VBRUserRoleAssignment', 'Get-VBRRbacRoleAssignment')
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'RBAC assignment cmdlet unavailable' } }
+            $a = @(& $c -ErrorAction Stop)
+            $roles = @($a | ForEach-Object { Get-PropSafe -InputObject $_ -Name @('Role', 'RoleName') } | Sort-Object -Unique)
+            @{ Status = $(if ($roles.Count -gt 1) { 'Passed' } else { 'Warning' }); Value = ("Distinct roles assigned: {0}" -f $(if ($roles) { ($roles -join ', ') } else { 'none' })) }
         }
 
-        Add-AuditResult -Topic 'Accounts and Permissions' -RuleName 'Veeam RBAC roles follow least privilege' `
-            -Status $(if ($adminAssignments.Count -le 2) { 'Passed' } else { 'Warning' }) `
-            -CurrentValue ("Roles: {0}. Assignments: {1}" -f `
-                $(if ($roleNames) { ($roleNames -join ', ') } else { 'n/a' }), `
-                $(if ($assignSummary) { ($assignSummary -join '; ') } else { 'none enumerated' })) `
-            -Recommendation 'Assign granular RBAC roles (Backup/Restore Operator) instead of Administrator; limit Administrator-role principals and enforce four-eyes for critical operations.' | Out-Null
-    }
-    catch {
-        Add-AuditResult -Topic 'Accounts and Permissions' -RuleName 'Veeam RBAC roles follow least privilege' `
-            -Status 'Error' -CurrentValue $_.Exception.Message `
-            -Recommendation 'Review Veeam Users and Roles manually.' | Out-Null
-    }
+    Invoke-Item -Num '5.9' -Topic $T -Name 'Are ONLY authorized accounts granted access to the VBR server' `
+        -Recommendation 'Restrict local Administrators to authorized accounts only.' -Check {
+            $admins = Get-Admins
+            if ($null -eq $admins) { return @{ Status = 'Warning'; Value = 'Could not enumerate local Administrators' } }
+            $dom = @($admins | Where-Object { $_.PrincipalSource -eq 'ActiveDirectory' })
+            $st = if ($dom.Count -eq 0 -and $admins.Count -le 3) { 'Passed' } else { 'Warning' }
+            @{ Status = $st; Value = ("{0} admin member(s): {1}" -f $admins.Count, (($admins.Name) -join ', ')) }
+        }
+
+    Invoke-Item -Num '5.10' -Topic $T -Name 'Are ONLY authorized accounts granted access to the backup repository' -Recommendation 'Restrict repository access to authorized accounts.'
+    Invoke-Item -Num '5.11' -Topic $T -Name 'Is certificate-based authentication used in place of user-based authentication wherever possible?' -Recommendation 'Prefer certificate-based auth over passwords for remote access.'
+    Invoke-Item -Num '5.12' -Topic $T -Name 'Do Linux systems leverage LDAP or AD?' -Recommendation 'Centralize Linux auth via LDAP/AD where applicable.'
+    Invoke-Item -Num '5.13' -Topic $T -Name 'Do Linux/Unix Systems leverage NIS/NSS?' -Recommendation 'Centralize Linux/Unix account management (NIS/NSS) where applicable.'
+    Invoke-Item -Num '5.14' -Topic $T -Name 'Do Linux/Unix Systems use SSH Private/Public Key with Passphrase credentials?' -Recommendation 'Use SSH key + passphrase for Linux/Unix credentials.'
+    Invoke-Item -Num '5.15' -Topic $T -Name 'Does SSH use strong password enforcement where applicable? (min of 15 characters)' -Recommendation 'Enforce >=15-character SSH passwords where used.'
+    Invoke-Item -Num '5.16' -Topic $T -Name 'Is a dedicated, audited account used for repository access' -Recommendation 'Use a dedicated audited repository access account.'
+    Invoke-Item -Num '5.17' -Topic $T -Name 'Is the account for repository access NOT root, or a member of Sudoers' -Recommendation 'Repository account must not be root / in sudoers (KB2676).'
+    Invoke-Item -Num '5.18' -Topic $T -Name 'Where required, is LINUX service account "NOT" root but leverages SUDOER, Firewall and PAM security?' -Recommendation 'Use non-root Linux service account with SUDOER/PAM/firewall controls (KB2676).'
+    Invoke-Item -Num '5.19' -Topic $T -Name 'Is access to the VBR database restricted to only authorized users?' -Recommendation 'Restrict VBR (PostgreSQL) database access to authorized users.'
+    Invoke-Item -Num '5.20' -Topic $T -Name 'Do only authorized users have access to all servers hosting VBR components?' `
+        -Recommendation 'Restrict access to all VBR component servers.' -Check {
+            $admins = Get-Admins
+            if ($null -eq $admins) { return @{ Status = 'Warning'; Value = 'Could not enumerate local Administrators' } }
+            @{ Status = 'Warning'; Value = ("Local Administrators ({0}): {1} - confirm all are authorized" -f $admins.Count, (($admins.Name) -join ', ')) }
+        }
+
+    Invoke-Item -Num '5.21' -Topic $T -Name 'Is user account auditing enabled at the OS-level?' `
+        -Recommendation 'Enable Logon / Account Management audit policy (Success+Failure).' -Check {
+            # Logon subcategory GUID (locale-independent lookup).
+            $out = ''
+            try { $out = (& auditpol.exe /get /subcategory:"{0CCE9215-69AE-11D9-BED3-505054503030}" 2>$null) -join ' ' } catch { }
+            $on = ($out -match 'Success' -or $out -match 'Failure')
+            @{ Status = $(if ($on) { 'Passed' } elseif ($out) { 'Failed' } else { 'Warning' }); Value = $(if ($out) { ($out -replace '\s+', ' ').Trim() } else { 'auditpol query failed' }) }
+        }
+
+    Invoke-Item -Num '5.22' -Topic $T -Name 'Is auditing enabled and functioning in Veeam ONE?' -Recommendation 'Verify auditing in Veeam ONE (separate product).'
+
+    Invoke-Item -Num '5.23' -Topic $T -Name 'Passwords, where used, are complex (minimum 15 characters, mix of case and characters)' `
+        -Recommendation 'Enforce >=15-character complex passwords (local security policy).' -Check {
+            $sp = Get-SecPol
+            $len = if ($sp.ContainsKey('MinimumPasswordLength')) { [int]$sp['MinimumPasswordLength'] } else { $null }
+            $cplx = if ($sp.ContainsKey('PasswordComplexity')) { [int]$sp['PasswordComplexity'] } else { $null }
+            $st = if ($len -ge 15 -and $cplx -eq 1) { 'Passed' } elseif ($len -ge 8) { 'Warning' } else { 'Failed' }
+            @{ Status = $st; Value = ("MinPasswordLength={0}; Complexity={1}" -f (nv $len), (nv $cplx)) }
+        }
+
+    Invoke-Item -Num '5.24' -Topic $T -Name 'Is an account lockout policy (after unsuccessful login attempts) in place?' `
+        -Recommendation 'Configure an account lockout threshold.' -Check {
+            $sp = Get-SecPol
+            $bad = if ($sp.ContainsKey('LockoutBadCount')) { [int]$sp['LockoutBadCount'] } else { $null }
+            $st = if ($bad -gt 0) { 'Passed' } elseif ($null -eq $bad) { 'Warning' } else { 'Failed' }
+            @{ Status = $st; Value = ("LockoutBadCount={0}" -f (nv $bad)) }
+        }
+
+    Invoke-Item -Num '5.25' -Topic $T -Name 'Do you have a safe, protected, air-gapped copy of all necessary credentials necessary to reach data (eg. Credentials for storage appliances).' -Recommendation 'Keep an air-gapped copy of recovery credentials in a secure vault.'
+
+    Invoke-Item -Num '5.26' -Topic $T -Name 'Are group Managed Service Accounts (gMSA) used wherever applicable (in the case of AAIP on Windows Domain-joined resources)' `
+        -Recommendation 'Use gMSA for applicable Windows domain-joined service accounts.' -Check {
+            $svc = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.StartName -match '\$$' })
+            @{ Status = $(if ($svc.Count -gt 0) { 'Passed' } else { 'Warning' }); Value = ("{0} service(s) using a managed-service/gMSA-style account" -f $svc.Count) }
+        }
+
+    Invoke-Item -Num '5.27' -Topic $T -Name 'Is Active Directory server protected using an unmanaged agent or crash consistent backup to avoid storing Domain admin account in Veeam DB ?' -Recommendation 'Protect DCs via unmanaged agent / crash-consistent backup to avoid storing DA creds.'
+    Invoke-Item -Num '5.28' -Topic $T -Name 'Is active alerting in place for unsuccessful login attempts?' -Recommendation 'Alert on failed login attempts.'
+    Invoke-Item -Num '5.29' -Topic $T -Name 'Are permissions applied to the hypervisor control plane applied using the principle of least privilege?' -Recommendation 'Apply least privilege to hypervisor control-plane permissions.'
+    Invoke-Item -Num '5.30' -Topic $T -Name 'Are permissions applied to protected recoverable applications being protected by Veeam using the principle of least privilege?' -Recommendation 'Apply least privilege to application processing accounts.'
+
+    Invoke-Item -Num '5.31' -Topic $T -Name 'Is 4-eyes authorization configured for critical changes to the backup infrastructure and archives?' `
+        -Recommendation 'Enable four-eyes authorization (four_eyes_authorization).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name @('Get-VBRFourEyesAuthorization', 'Get-VBRSecurityOfficer')
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'Four-eyes cmdlet unavailable' } }
+            $r = @(& $c -ErrorAction Stop)
+            @{ Status = $(if ($r.Count -gt 0) { 'Passed' } else { 'Warning' }); Value = ("Four-eyes/Security Officer configured: {0}" -f ($r.Count -gt 0)) }
+        }
+
+    Invoke-Item -Num '5.32' -Topic $T -Name 'Are custom RBAC roles configured following least privilege principles?' `
+        -Recommendation 'Assign granular RBAC roles instead of Administrator (configure_roles).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name @('Get-VBRSecurityRole', 'Get-VBRRbacRole', 'Get-VBRUserRoleMapping')
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'RBAC role cmdlet unavailable' } }
+            $roles = @(& $c -ErrorAction Stop)
+            $names = @($roles | ForEach-Object { Get-PropSafe -InputObject $_ -Name @('Name', 'RoleName', 'DisplayName') })
+            @{ Status = $(if ($roles.Count -gt 0) { 'Passed' } else { 'Warning' }); Value = ("Roles: {0}" -f $(if ($names) { ($names -join ', ') } else { 'none' })) }
+        }
+
+    Invoke-Item -Num '5.33' -Topic $T -Name 'Are Backup Operators/Restore users scope limited to relevant data for their role?' -Recommendation 'Scope-limit Backup/Restore operators to relevant data (configure_roles).'
+    Invoke-Item -Num '5.34' -Topic $T -Name 'Are recovery verification tokens used to authorize restore operations?' -Recommendation 'Use recovery verification tokens for restore authorization.'
+    Invoke-Item -Num '5.35' -Topic $T -Name 'Are permissions applied to hypervisor control plane using the principle of least privilege? (copy)' -Recommendation 'Apply least privilege to the hypervisor control plane.'
 }
 
 #endregion
 
-#region ----------------------------------------------------------------------- 5. Encryption
+#region ----------------------------------------------------------------------- 6. Encryption
 
 function Invoke-EncryptionChecks {
-    Write-Host "`n--- 5. Encryption ---" -ForegroundColor White
+    Write-Host "`n--- 6. Encryption ---" -ForegroundColor White
+    $T = 'Encryption'
 
-    if (-not $script:VbrConnected) {
-        Add-AuditResult -Topic 'Encryption' -RuleName 'Backup job / network / KMS encryption' `
-            -Status 'Warning' -CurrentValue 'No VBR session' `
-            -Recommendation 'Establish a VBR connection to evaluate encryption settings.' | Out-Null
-        return
-    }
+    Invoke-Item -Num '6.1' -Topic $T -Name 'Is certificate thumbprint validation enabled for component-to-component authentication?' -Recommendation 'Enable certificate thumbprint validation (cloud_connect_ssl_verify).'
 
-    # 5.1 Backup job encryption --------------------------------------------------------
-    try {
-        # Get-VBRJob returns all configured jobs. Storage-level encryption lives on the
-        # job's options object: (Get-VBRJobOptions $job).BackupStorageOptions.StorageEncryptionEnabled.
-        $jobs = @(Get-VBRJob -ErrorAction Stop)
-
-        if (-not $jobs -or $jobs.Count -eq 0) {
-            Add-AuditResult -Topic 'Encryption' -RuleName 'Backup jobs are encrypted' `
-                -Status 'Warning' -CurrentValue 'No backup jobs found' `
-                -Recommendation 'Enable storage-level encryption on every backup job.' | Out-Null
+    Invoke-Item -Num '6.2' -Topic $T -Name 'Are private encryption keys stored securely? E.g. in a Key Management System (KMS)' `
+        -Recommendation 'Store encryption keys in an external KMS (encryption_kms).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name @('Get-VBRKMSServer', 'Get-VBRKMSInfo')
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'KMS cmdlet unavailable' } }
+            $kms = @(& $c -ErrorAction Stop)
+            @{ Status = $(if ($kms.Count -gt 0) { 'Passed' } else { 'Warning' }); Value = ("{0} KMS server(s) configured" -f $kms.Count) }
         }
-        else {
-            $encrypted = 0; $unencrypted = @()
-            foreach ($job in $jobs) {
-                $enc = $null
+
+    Invoke-Item -Num '6.3' -Topic $T -Name 'Are backup encryption passwords regularly checked for strength?' -Recommendation 'Periodically verify encryption password strength (password_manager_verify).'
+
+    Invoke-Item -Num '6.4' -Topic $T -Name 'Is SMBv3 signing and encryption enabled where applicable?' `
+        -Recommendation 'Enable SMB signing and encryption on the server.' -Check {
+            if (-not (Get-Command Get-SmbServerConfiguration -ErrorAction SilentlyContinue)) { return @{ Status = 'Warning'; Value = 'SMB cmdlet unavailable' } }
+            $s = Get-SmbServerConfiguration -ErrorAction Stop
+            $st = if ($s.EncryptData -and $s.RequireSecuritySignature) { 'Passed' } elseif ($s.EncryptData -or $s.RequireSecuritySignature) { 'Warning' } else { 'Failed' }
+            @{ Status = $st; Value = ("EncryptData={0}; RequireSecuritySignature={1}" -f $s.EncryptData, $s.RequireSecuritySignature) }
+        }
+
+    Invoke-Item -Num '6.5' -Topic $T -Name 'Are backups encrypted?' `
+        -Recommendation 'Enable AES-256 storage encryption on all backup jobs (data_encryption).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $jobs = @(Get-Jobs)
+            if ($jobs.Count -eq 0) { return @{ Status = 'Warning'; Value = 'No jobs found' } }
+            $enc = 0; $un = @()
+            foreach ($j in $jobs) {
+                $e = $null
                 try {
-                    $opts = Get-VBRJobOptions -Job $job -ErrorAction Stop
-                    # BackupStorageOptions.StorageEncryptionEnabled is the canonical flag.
-                    $storageOpts = Get-PropSafe -InputObject $opts -Name @('BackupStorageOptions')
-                    $enc = Get-PropSafe -InputObject $storageOpts -Name @('StorageEncryptionEnabled', 'EncryptionEnabled')
-                }
-                catch { }
-                # Fallback: some job objects expose encryption on the info/description.
-                if ($null -eq $enc) {
-                    $enc = Get-PropSafe -InputObject $job -Name @('IsEncrypted', 'EncryptionEnabled')
-                }
-
-                $jobName = Get-PropSafe -InputObject $job -Name @('Name')
-                if ($enc -eq $true) { $encrypted++ } else { $unencrypted += $jobName }
+                    $o = Get-VBRJobOptions -Job $j -ErrorAction Stop
+                    $e = Get-PropSafe -InputObject (Get-PropSafe -InputObject $o -Name @('BackupStorageOptions')) -Name @('StorageEncryptionEnabled', 'EncryptionEnabled')
+                } catch { }
+                if ($null -eq $e) { $e = Get-PropSafe -InputObject $j -Name @('IsEncrypted', 'EncryptionEnabled') }
+                if ($e -eq $true) { $enc++ } else { $un += (Get-PropSafe -InputObject $j -Name @('Name')) }
             }
+            @{ Status = $(if ($un.Count -eq 0) { 'Passed' } else { 'Failed' }); Value = ("{0}/{1} jobs encrypted{2}" -f $enc, $jobs.Count, $(if ($un) { '; unencrypted: ' + ($un -join ', ') } else { '' })) }
+        }
 
-            Add-AuditResult -Topic 'Encryption' -RuleName 'Backup jobs are encrypted' `
-                -Status $(if ($unencrypted.Count -eq 0) { 'Passed' } else { 'Failed' }) `
-                -CurrentValue ("{0} of {1} jobs encrypted{2}" -f $encrypted, $jobs.Count, `
-                    $(if ($unencrypted) { '. Unencrypted: ' + ($unencrypted -join ', ') } else { '' })) `
-                -Recommendation 'Enable AES-256 storage encryption on all backup jobs; store passwords in a KMS / secure vault.' | Out-Null
+    Invoke-Item -Num '6.6' -Topic $T -Name 'Is all backup network traffic encrypted?' `
+        -Recommendation 'Enforce a network traffic encryption rule (enable_network_encryption).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name 'Get-VBRNetworkTrafficRule'
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'Network traffic rule cmdlet unavailable' } }
+            $rules = @(& $c -ErrorAction Stop)
+            $enc = @($rules | Where-Object { (Get-PropSafe -InputObject $_ -Name @('EncryptionEnabled')) -eq $true })
+            $st = if ($rules.Count -gt 0 -and $enc.Count -eq $rules.Count) { 'Passed' } elseif ($enc.Count -gt 0) { 'Warning' } else { 'Failed' }
+            @{ Status = $st; Value = ("{0}/{1} traffic rule(s) enforce encryption" -f $enc.Count, $rules.Count) }
         }
-    }
-    catch {
-        Add-AuditResult -Topic 'Encryption' -RuleName 'Backup jobs are encrypted' `
-            -Status 'Error' -CurrentValue $_.Exception.Message `
-            -Recommendation 'Review per-job encryption in the VBR console.' | Out-Null
-    }
 
-    # 5.2 Network traffic encryption ---------------------------------------------------
-    try {
-        # Get-VBRNetworkTrafficRule returns global network traffic rules; each exposes an
-        # EncryptionEnabled flag governing in-flight encryption between components.
-        $ruleCmd = Test-VeeamCmdlet -Name 'Get-VBRNetworkTrafficRule'
-        if ($ruleCmd) {
-            $rules = @(& $ruleCmd -ErrorAction Stop)
-            $encRules = @($rules | Where-Object { (Get-PropSafe -InputObject $_ -Name @('EncryptionEnabled')) -eq $true })
-            Add-AuditResult -Topic 'Encryption' -RuleName 'Backup network traffic is encrypted' `
-                -Status $(if ($rules.Count -gt 0 -and $encRules.Count -eq $rules.Count) { 'Passed' } elseif ($encRules.Count -gt 0) { 'Warning' } else { 'Failed' }) `
-                -CurrentValue ("{0} of {1} traffic rule(s) enforce encryption" -f $encRules.Count, $rules.Count) `
-                -Recommendation 'Add/verify a network traffic rule that encrypts traffic between proxies, repositories, gateways and object stores.' | Out-Null
-        }
-        else {
-            Add-AuditResult -Topic 'Encryption' -RuleName 'Backup network traffic is encrypted' `
-                -Status 'Warning' -CurrentValue 'Get-VBRNetworkTrafficRule unavailable' `
-                -Recommendation 'Verify network traffic encryption rules in the VBR console.' | Out-Null
-        }
-    }
-    catch {
-        Add-AuditResult -Topic 'Encryption' -RuleName 'Backup network traffic is encrypted' `
-            -Status 'Error' -CurrentValue $_.Exception.Message `
-            -Recommendation 'Verify network traffic encryption manually.' | Out-Null
-    }
+    Invoke-Item -Num '6.7' -Topic $T -Name 'Is Enterprise Manager deployed and able to perform password loss protection?' -Recommendation 'Deploy Enterprise Manager for password loss protection.'
+    Invoke-Item -Num '6.8' -Topic $T -Name 'Is Enterprise Manager deployed seperately from the VBR server?' -Recommendation 'Deploy Enterprise Manager separately from the VBR server.'
+    Invoke-Item -Num '6.9' -Topic $T -Name 'Are verified public certificates in use or Veeam Self Signed Certificates?' -Recommendation 'Prefer verified public/CA certificates over self-signed.'
+    Invoke-Item -Num '6.10' -Topic $T -Name 'Is OpenSSL 3.0 or higher in use for all cryptographic operations?' -Recommendation 'Verify OpenSSL 3.0+ via the Best Practice Analyzer.'
+    Invoke-Item -Num '6.11' -Topic $T -Name 'Are backup plugins configured for source-side encryption before data transfer?' -Recommendation 'Enable source-side encryption on backup plugins.'
 
-    # 5.3 KMS integration --------------------------------------------------------------
-    try {
-        # Get-VBRKMSServer (v12.1+) lists configured Key Management Systems used to store
-        # encryption keys outside the VBR configuration database.
-        $kmsCmd = Test-VeeamCmdlet -Name @('Get-VBRKMSServer', 'Get-VBRKMSInfo')
-        if ($kmsCmd) {
-            $kms = @(& $kmsCmd -ErrorAction Stop)
-            Add-AuditResult -Topic 'Encryption' -RuleName 'KMS integration for encryption keys' `
-                -Status $(if ($kms.Count -gt 0) { 'Passed' } else { 'Warning' }) `
-                -CurrentValue ("{0} KMS server(s) configured{1}" -f $kms.Count, `
-                    $(if ($kms.Count) { ': ' + (($kms | ForEach-Object { Get-PropSafe -InputObject $_ -Name @('Name','ServerName') }) -join ', ') } else { '' })) `
-                -Recommendation 'Store encryption keys in an external KMS rather than only in the VBR configuration database.' | Out-Null
+    Invoke-Item -Num '6.12' -Topic $T -Name 'Is encryption enabled for all backup repositories?' `
+        -Recommendation 'Ensure backups written to every repository are encrypted (via job/repo encryption).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $jobs = @(Get-Jobs)
+            if ($jobs.Count -eq 0) { return @{ Status = 'Warning'; Value = 'No jobs found - verify per repository' } }
+            $un = 0
+            foreach ($j in $jobs) {
+                try { $o = Get-VBRJobOptions -Job $j -ErrorAction Stop; if ((Get-PropSafe -InputObject (Get-PropSafe -InputObject $o -Name @('BackupStorageOptions')) -Name @('StorageEncryptionEnabled')) -ne $true) { $un++ } } catch { $un++ }
+            }
+            @{ Status = $(if ($un -eq 0) { 'Passed' } else { 'Warning' }); Value = ("{0} job(s) write unencrypted data to repositories" -f $un) }
         }
-        else {
-            Add-AuditResult -Topic 'Encryption' -RuleName 'KMS integration for encryption keys' `
-                -Status 'Warning' -CurrentValue 'KMS cmdlet unavailable in this build' `
-                -Recommendation 'Confirm KMS integration in the VBR console (encryption_kms).' | Out-Null
-        }
-    }
-    catch {
-        Add-AuditResult -Topic 'Encryption' -RuleName 'KMS integration for encryption keys' `
-            -Status 'Error' -CurrentValue $_.Exception.Message `
-            -Recommendation 'Verify KMS integration manually.' | Out-Null
-    }
 }
 
 #endregion
 
-#region ----------------------------------------------------------------------- 6. Detection
+#region ----------------------------------------------------------------------- 7. Operational
 
-function Invoke-DetectionChecks {
-    Write-Host "`n--- 6. Detection (malware / IOC / anomaly) ---" -ForegroundColor White
+function Invoke-OperationalChecks {
+    Write-Host "`n--- 7. Operational ---" -ForegroundColor White
+    $T = 'Operational'
 
-    if (-not $script:VbrConnected) {
-        Add-AuditResult -Topic 'Detection' -RuleName 'Malware / IOC / anomaly detection' `
-            -Status 'Warning' -CurrentValue 'No VBR session' `
-            -Recommendation 'Establish a VBR connection to evaluate malware detection settings.' | Out-Null
-        return
-    }
-
-    try {
-        # Get-VBRMalwareDetectionOptions (v12.1+/v13) returns the global malware detection
-        # configuration object. Property names vary by build, so probe candidates.
-        $mdCmd = Test-VeeamCmdlet -Name @('Get-VBRMalwareDetectionOptions', 'Get-VBRMalwareDetection')
-        if (-not $mdCmd) {
-            Add-AuditResult -Topic 'Detection' -RuleName 'Global malware detection enabled' `
-                -Status 'Warning' -CurrentValue 'Malware detection cmdlet unavailable' `
-                -Recommendation 'Verify Inline Scan / Guest Indexing malware detection in the VBR console.' | Out-Null
-            return
+    Invoke-Item -Num '7.1' -Topic $T -Name 'Is Veeam Security Analyzer configured for continuous compliance monitoring?' `
+        -Recommendation 'Run/schedule the Security & Compliance (Best Practice) Analyzer.' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name @('Get-VBRBestPracticeAnalyzer', 'Start-VBRSecurityComplianceAnalyzer', 'Get-VBRSecurityComplianceAnalyzer')
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'Analyzer cmdlet unavailable - verify in console' } }
+            @{ Status = 'Warning'; Value = ("Analyzer cmdlet present ({0}) - confirm it is scheduled" -f $c) }
         }
 
-        $md = & $mdCmd -ErrorAction Stop
+    Invoke-Item -Num '7.2' -Topic $T -Name 'Did you implement a honeypot/decoy VBR server ?' -Recommendation 'Consider a honeypot/decoy VBR server.'
+    Invoke-Item -Num '7.3' -Topic $T -Name 'Does all backup traffic traverse an isolated network?' -Recommendation 'Route backup traffic over an isolated network (select_backup_network).'
+    Invoke-Item -Num '7.4' -Topic $T -Name 'Is ransomware detection in place for perimeter infrstructure and for production data?' -Recommendation 'Deploy perimeter/production ransomware detection (front-end vendor).'
+    Invoke-Item -Num '7.5' -Topic $T -Name 'Is there policy in place to train backup admins on avoidance of phishing or other social engineering attacks?' -Recommendation 'Maintain phishing/social-engineering training for backup admins.'
+    Invoke-Item -Num '7.6' -Topic $T -Name 'Are you subscribed to Veeam Security Advisories?' -Recommendation 'Subscribe to Veeam Security Advisories.'
+}
 
-        # 6.1 Master malware detection toggle.
-        $enabled = Get-PropSafe -InputObject $md -Name @('EnableMalwareDetection', 'IsEnabled', 'MalwareDetectionEnabled')
-        Add-AuditResult -Topic 'Detection' -RuleName 'Global malware detection enabled' `
-            -Status $(if ($enabled -eq $true) { 'Passed' } elseif ($null -eq $enabled) { 'Warning' } else { 'Failed' }) `
-            -CurrentValue ("EnableMalwareDetection={0}" -f $(if ($null -eq $enabled) { 'unknown' } else { $enabled })) `
-            -Recommendation 'Enable malware detection so restore points are scanned before finalisation.' | Out-Null
+#endregion
 
-        # 6.2 Guest Index + IOC detection.
-        $guestIndex = Get-PropSafe -InputObject $md -Name @('EnableGuestIndexAnalysis', 'GuestIndexAnalysisEnabled', 'GuestFileSystemAnalysis')
-        $iocEnabled = Get-PropSafe -InputObject $md -Name @('EnableSuspiciousFileDetection', 'IndicatorOfCompromiseEnabled', 'EnableIoCDetection', 'SuspiciousActivityEnabled')
-        Add-AuditResult -Topic 'Detection' -RuleName 'Guest Index & IOC (suspicious file) detection enabled' `
-            -Status $(if ($guestIndex -eq $true -or $iocEnabled -eq $true) { 'Passed' } elseif ($null -eq $guestIndex -and $null -eq $iocEnabled) { 'Warning' } else { 'Failed' }) `
-            -CurrentValue ("GuestIndex={0}; IOC={1}" -f `
-                $(if ($null -eq $guestIndex) { 'unknown' } else { $guestIndex }), `
-                $(if ($null -eq $iocEnabled) { 'unknown' } else { $iocEnabled })) `
-            -Recommendation 'Enable Guest Indexing plus Indicator-of-Compromise / suspicious-file detection tools.' | Out-Null
+#region ----------------------------------------------------------------------- 8. NAS-specific
 
-        # 6.3 Inline entropy / AI-based anomaly detection.
-        $entropy = Get-PropSafe -InputObject $md -Name @('EnableInlineEntropyAnalysis', 'InlineEntropyEnabled', 'EnableDataBlockAnalysis', 'EnableInlineScan')
-        Add-AuditResult -Topic 'Detection' -RuleName 'Inline entropy / AI-based anomaly detection enabled' `
-            -Status $(if ($entropy -eq $true) { 'Passed' } elseif ($null -eq $entropy) { 'Warning' } else { 'Failed' }) `
-            -CurrentValue ("InlineEntropyAnalysis={0}" -f $(if ($null -eq $entropy) { 'unknown' } else { $entropy })) `
-            -Recommendation 'Enable inline data-block entropy analysis to flag ransomware-style encryption anomalies in real time.' | Out-Null
+function Invoke-NasChecks {
+    Write-Host "`n--- 8. NAS-specific ---" -ForegroundColor White
+    $T = 'NAS-specific'
 
-        # 6.4 Linux workload malware scanning.
-        # Linux/agent scanning may live on the global object or a dedicated agent cmdlet.
-        $linux = Get-PropSafe -InputObject $md -Name @('EnableLinuxMalwareDetection', 'LinuxWorkloadScanEnabled', 'EnableAgentMalwareDetection')
-        Add-AuditResult -Topic 'Detection' -RuleName 'Linux workload malware detection enabled' `
-            -Status $(if ($linux -eq $true) { 'Passed' } elseif ($null -eq $linux) { 'Warning' } else { 'Failed' }) `
-            -CurrentValue ("LinuxMalwareDetection={0}" -f $(if ($null -eq $linux) { 'unknown - verify agent settings' } else { $linux })) `
-            -Recommendation 'Enable malware detection for Linux agents / workloads (agents_malware_detection).' | Out-Null
-    }
-    catch {
-        Add-AuditResult -Topic 'Detection' -RuleName 'Malware / IOC / anomaly detection' `
-            -Status 'Error' -CurrentValue $_.Exception.Message `
-            -Recommendation 'Review malware detection settings in the VBR console.' | Out-Null
-    }
+    Invoke-Item -Num '8.1' -Topic $T -Name 'Are NAS shares accessible on an isolated/separated backup network from production network?' -Recommendation 'Place NAS shares on an isolated backup network.'
+
+    Invoke-Item -Num '8.2' -Topic $T -Name 'Is/are there global network traffic rule(s) that encrypts traffic between cache repo, file proxies, repositories, archive gateway, object store?' `
+        -Recommendation 'Add a global network traffic encryption rule (enable_network_encryption).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name 'Get-VBRNetworkTrafficRule'
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'Network traffic rule cmdlet unavailable' } }
+            $rules = @(& $c -ErrorAction Stop)
+            $enc = @($rules | Where-Object { (Get-PropSafe -InputObject $_ -Name @('EncryptionEnabled')) -eq $true })
+            @{ Status = $(if ($enc.Count -gt 0) { 'Passed' } else { 'Failed' }); Value = ("{0}/{1} traffic rule(s) encrypt" -f $enc.Count, $rules.Count) }
+        }
+
+    Invoke-Item -Num '8.3' -Topic $T -Name 'Are firewall rules in place to only allow for necessary backup/restore traffic operations?' `
+        -Recommendation 'Restrict firewall rules to required backup/restore traffic (used_ports).' -Check {
+            if (-not (Get-Command Get-NetFirewallProfile -ErrorAction SilentlyContinue)) { return @{ Status = 'Warning'; Value = 'Firewall cmdlets unavailable' } }
+            $off = @(Get-NetFirewallProfile -ErrorAction Stop | Where-Object { -not $_.Enabled })
+            @{ Status = $(if ($off.Count -eq 0) { 'Passed' } else { 'Failed' }); Value = $(if ($off.Count -eq 0) { 'Firewall enabled on all profiles' } else { 'Disabled on: ' + (($off.Name) -join ', ') }) }
+        }
+
+    Invoke-Item -Num '8.4' -Topic $T -Name 'Are NAS backups encrypted?' -Recommendation 'Encrypt NAS (unstructured data) backup jobs.'
+    Invoke-Item -Num '8.5' -Topic $T -Name 'Is there a secondary backup copy?' `
+        -Recommendation 'Create a secondary backup copy (backup_copy).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name 'Get-VBRBackupCopyJob'
+            $bc = if ($c) { @(& $c -ErrorAction SilentlyContinue) } else { @() }
+            @{ Status = $(if ($bc.Count -gt 0) { 'Passed' } else { 'Warning' }); Value = ("{0} backup copy job(s)" -f $bc.Count) }
+        }
+    Invoke-Item -Num '8.6' -Topic $T -Name 'Is backup Archiving in use (for NAS i.e. secondary copy)?' -Recommendation 'Use archiving for NAS secondary copies where applicable.'
+    Invoke-Item -Num '8.7' -Topic $T -Name 'Are the appropriate and least privileges set for storage integration account?' -Recommendation 'Apply least privilege to the storage integration account.'
+    Invoke-Item -Num '8.8' -Topic $T -Name 'Is the account used for NAS backup separate from the storage integration account?' -Recommendation 'Separate NAS backup and storage integration accounts.'
+    Invoke-Item -Num '8.9' -Topic $T -Name 'Is the account used for SMB share backup restricted to "read-only/least privileges" permissions?' -Recommendation 'Restrict SMB backup account to read-only/least privilege.'
+    Invoke-Item -Num '8.10' -Topic $T -Name 'Are NFS share''s "NFS hosts" list restricted to the file proxies only with "read only" permissions?' -Recommendation 'Restrict NFS hosts to file proxies with read-only access.'
+    Invoke-Item -Num '8.11' -Topic $T -Name 'Are Share write permissions only manually granted upon restore operations?' -Recommendation 'Grant share write access only during restore operations.'
+    Invoke-Item -Num '8.12' -Topic $T -Name 'Are there Share definitions for restore operations only?' -Recommendation 'Define restore-only share definitions.'
+    Invoke-Item -Num '8.13' -Topic $T -Name 'Is a gateway server defined for NAS archive tier i.e. gateway moved away from SOBR extents hosting backup data?' -Recommendation 'Use a dedicated gateway for the NAS archive tier.'
+    Invoke-Item -Num '8.14' -Topic $T -Name 'Is there a mount server defined away from the "production" network?' -Recommendation 'Place the mount server off the production network.'
+}
+
+#endregion
+
+#region ----------------------------------------------------------------------- 9. DR & Testing
+
+function Invoke-DrChecks {
+    Write-Host "`n--- 9. Disaster Recovery & Testing ---" -ForegroundColor White
+    $T = 'Disaster Recovery & Testing'
+
+    Invoke-Item -Num '9.1' -Topic $T -Name 'Are cloud-based recovery options configured for disaster recovery scenarios?' -Recommendation 'Configure cloud-based DR recovery options where applicable.'
+    Invoke-Item -Num '9.2' -Topic $T -Name 'Is the Veeam Orchestrator server secured?' -Recommendation 'Secure the Veeam Recovery Orchestrator server (apply VBR hardening).'
+    Invoke-Item -Num '9.3' -Topic $T -Name 'Is your disaster recovery orchestrated through automation?' -Recommendation 'Automate DR via orchestrated recovery plans.'
+    Invoke-Item -Num '9.4' -Topic $T -Name 'Are there disaster recovery plans, playbooks and/or runbooks for DR orchestration in place?' -Recommendation 'Maintain DR plans/runbooks.'
+    Invoke-Item -Num '9.5' -Topic $T -Name 'Did you ever perform a DR test against existing runbooks?' -Recommendation 'Perform periodic DR tests against runbooks.'
+
+    Invoke-Item -Num '9.6' -Topic $T -Name 'Is there a regular testing regimen in place for recovery from backup?' `
+        -Recommendation 'Schedule SureBackup recovery verification jobs.' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $c = Test-VeeamCmdlet -Name 'Get-VBRSureBackupJob'
+            if (-not $c) { return @{ Status = 'Warning'; Value = 'SureBackup cmdlet unavailable' } }
+            $sb = @(& $c -ErrorAction Stop)
+            @{ Status = $(if ($sb.Count -gt 0) { 'Passed' } else { 'Warning' }); Value = ("{0} SureBackup job(s) configured" -f $sb.Count) }
+        }
+
+    Invoke-Item -Num '9.7' -Topic $T -Name 'Is there a regular testing regimen in place for recovery from replicas?' -Recommendation 'Test recovery from replicas regularly (SureReplica / DR tests).'
+    Invoke-Item -Num '9.8' -Topic $T -Name 'Is your recovery response / SWAT team ready?' -Recommendation 'Maintain a ready recovery/SWAT team with drills.'
+    Invoke-Item -Num '9.9' -Topic $T -Name 'Are you aware of the core applications that would allow business continuity after a blackout / service-loss event?' -Recommendation 'Document core applications for business continuity.'
+    Invoke-Item -Num '9.10' -Topic $T -Name 'Are you aware of the support infrastructure that would allow business continuity after a blackout  service-loss event?' -Recommendation 'Document supporting infrastructure for business continuity.'
+    Invoke-Item -Num '9.11' -Topic $T -Name 'Is there sufficient documentation in offline or printed form to support the restoration process that is available to the recovery response / SWAT team?' -Recommendation 'Keep offline/printed restoration documentation.'
+    Invoke-Item -Num '9.12' -Topic $T -Name 'Is Universal Restore configured for cross-platform recovery (P2V, V2V, V2P)?' -Recommendation 'Prepare Universal Restore media for cross-platform recovery.'
+}
+
+#endregion
+
+#region ----------------------------------------------------------------------- 10. Detection
+
+function Invoke-DetectionChecks {
+    Write-Host "`n--- 10. Detection ---" -ForegroundColor White
+    $T = 'Detection'
+
+    # Shared global malware detection options object.
+    Invoke-Item -Num '10.1' -Topic $T -Name 'Is proactive malware scanning enabled before backup finalization?' `
+        -Recommendation 'Enable malware detection / inline scanning (malware_detection).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $mw = Get-MalwareOpts
+            if (-not $mw) { return @{ Status = 'Warning'; Value = 'Malware detection options unavailable' } }
+            $en = Get-PropSafe -InputObject $mw -Name @('EnableMalwareDetection', 'IsEnabled', 'MalwareDetectionEnabled')
+            @{ Status = $(if ($en -eq $true) { 'Passed' } elseif ($null -eq $en) { 'Warning' } else { 'Failed' }); Value = ("Malware detection enabled={0}" -f (nv $en)) }
+        }
+
+    Invoke-Item -Num '10.2' -Topic $T -Name 'Is Veeam inline entropy analysis enabled?' `
+        -Recommendation 'Enable inline data-block entropy analysis.' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $mw = Get-MalwareOpts
+            if (-not $mw) { return @{ Status = 'Warning'; Value = 'Malware detection options unavailable' } }
+            $e = Get-PropSafe -InputObject $mw -Name @('EnableInlineEntropyAnalysis', 'InlineEntropyEnabled', 'EnableDataBlockAnalysis', 'EnableInlineScan')
+            @{ Status = $(if ($e -eq $true) { 'Passed' } elseif ($null -eq $e) { 'Warning' } else { 'Failed' }); Value = ("Inline entropy analysis={0}" -f (nv $e)) }
+        }
+
+    Invoke-Item -Num '10.3' -Topic $T -Name 'Is Veeam suspicious file activity detection enabled?' `
+        -Recommendation 'Enable suspicious file activity (guest index) detection.' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $mw = Get-MalwareOpts
+            if (-not $mw) { return @{ Status = 'Warning'; Value = 'Malware detection options unavailable' } }
+            $s = Get-PropSafe -InputObject $mw -Name @('EnableSuspiciousFileDetection', 'SuspiciousActivityEnabled', 'EnableFileSystemActivityAnalysis')
+            @{ Status = $(if ($s -eq $true) { 'Passed' } elseif ($null -eq $s) { 'Warning' } else { 'Failed' }); Value = ("Suspicious file activity detection={0}" -f (nv $s)) }
+        }
+
+    Invoke-Item -Num '10.4' -Topic $T -Name 'Is Veeam Threat Hunter or anti-virus installed and configured on the Veeam Mount Server(s)?' -Recommendation 'Install/enable Threat Hunter or AV on mount servers (secure_restore).'
+    Invoke-Item -Num '10.5' -Topic $T -Name 'Are YARA rules configured on the Veeam Mount Server?' -Recommendation 'Deploy YARA rules on the mount server.'
+
+    Invoke-Item -Num '10.6' -Topic $T -Name 'Is there a regimen in place for regular backup scans?' -Recommendation 'Schedule regular backup content scans.'
+    Invoke-Item -Num '10.7' -Topic $T -Name 'Is Secure Restore configured with appropriate anti-virus and/or YARA rules?' -Recommendation 'Configure Secure Restore with AV/YARA scanning.'
+    Invoke-Item -Num '10.8' -Topic $T -Name 'Are anti-malware and/or YARA rules kept up to date?' -Recommendation 'Keep AV/YARA rule definitions current.'
+    Invoke-Item -Num '10.9' -Topic $T -Name 'Is there a regimen in place for regular testing of Secure Restore?' -Recommendation 'Regularly test Secure Restore.'
+    Invoke-Item -Num '10.10' -Topic $T -Name 'Is there a process in place for marking (timestamp) specific restore points as infected or clean where applicable? i.e. using Veeam Backup browser' -Recommendation 'Mark restore points clean/infected via the backup browser.'
+
+    Invoke-Item -Num '10.11' -Topic $T -Name 'Is Indicator of Compromise (tools) detection enabled?' `
+        -Recommendation 'Enable Indicator-of-Compromise detection (malware_detection_guest_index_ioc).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $mw = Get-MalwareOpts
+            if (-not $mw) { return @{ Status = 'Warning'; Value = 'Malware detection options unavailable' } }
+            $i = Get-PropSafe -InputObject $mw -Name @('IndicatorOfCompromiseEnabled', 'EnableIoCDetection', 'EnableIndicatorOfCompromise')
+            @{ Status = $(if ($i -eq $true) { 'Passed' } elseif ($null -eq $i) { 'Warning' } else { 'Failed' }); Value = ("IOC detection={0}" -f (nv $i)) }
+        }
+
+    Invoke-Item -Num '10.12' -Topic $T -Name 'Is Recon deployed?' -Recommendation 'Consider deploying Veeam Recon (Coveware).'
+    Invoke-Item -Num '10.13' -Topic $T -Name 'Is there a process in place to regularly review Recon reports?' -Recommendation 'Regularly review Recon reports.'
+
+    Invoke-Item -Num '10.14' -Topic $T -Name 'Is Linux malware detection enabled for Linux-based workloads?' `
+        -Recommendation 'Enable malware detection for Linux agents/workloads (agents_malware_detection).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $mw = Get-MalwareOpts
+            if (-not $mw) { return @{ Status = 'Warning'; Value = 'Malware detection options unavailable' } }
+            $l = Get-PropSafe -InputObject $mw -Name @('EnableLinuxMalwareDetection', 'LinuxWorkloadScanEnabled', 'EnableAgentMalwareDetection')
+            @{ Status = $(if ($l -eq $true) { 'Passed' } elseif ($null -eq $l) { 'Warning' } else { 'Failed' }); Value = ("Linux malware detection={0}" -f (nv $l)) }
+        }
+
+    Invoke-Item -Num '10.15' -Topic $T -Name 'Is cloud workload malware scanning enabled (AWS, Azure, GCP) if applicable?' -Recommendation 'Enable malware scanning for cloud workloads where applicable.'
+
+    Invoke-Item -Num '10.16' -Topic $T -Name 'Is AI-based anomaly detection enabled for entropy analysis and ransomware detection?' `
+        -Recommendation 'Enable AI-based anomaly detection thresholds (malware_detection_data_blocks).' -Check {
+            if (-not $script:VbrConnected) { return @{ Status = 'Warning'; Value = 'No VBR session' } }
+            $mw = Get-MalwareOpts
+            if (-not $mw) { return @{ Status = 'Warning'; Value = 'Malware detection options unavailable' } }
+            $a = Get-PropSafe -InputObject $mw -Name @('EnableAiAnomalyDetection', 'AnomalyDetectionEnabled', 'EnableInlineEntropyAnalysis', 'EnableDataBlockAnalysis')
+            @{ Status = $(if ($a -eq $true) { 'Passed' } elseif ($null -eq $a) { 'Warning' } else { 'Failed' }); Value = ("AI/anomaly (data-block) detection={0}" -f (nv $a)) }
+        }
+
+    Invoke-Item -Num '10.17' -Topic $T -Name 'Is object-level threat detection enabled for file system changes?' -Recommendation 'Enable object-level / VSS file-system change detection where applicable.'
 }
 
 #endregion
@@ -1005,27 +1185,15 @@ function Invoke-DetectionChecks {
 #region ----------------------------------------------------------------------- Reporting
 
 function Export-ComplianceReport {
-    [CmdletBinding()]
-    param()
-
     $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    if (-not (Test-Path -LiteralPath $ReportPath)) {
-        New-Item -ItemType Directory -Path $ReportPath -Force | Out-Null
-    }
+    if (-not (Test-Path -LiteralPath $ReportPath)) { New-Item -ItemType Directory -Path $ReportPath -Force | Out-Null }
 
-    # --- CSV ---
     if ($ReportFormat -in @('CSV', 'Both')) {
         $csvFile = Join-Path $ReportPath ("VBR_CyberSecure_Audit_{0}_{1}.csv" -f $env:COMPUTERNAME, $timestamp)
-        try {
-            $script:Results | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
-            Write-Host ("[+] CSV report written: {0}" -f $csvFile) -ForegroundColor Green
-        }
-        catch {
-            Write-Warning ("Failed to write CSV report: {0}" -f $_.Exception.Message)
-        }
+        try { $script:Results | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8; Write-Host ("[+] CSV report: {0}" -f $csvFile) -ForegroundColor Green }
+        catch { Write-Warning ("Failed to write CSV: {0}" -f $_.Exception.Message) }
     }
 
-    # --- HTML ---
     if ($ReportFormat -in @('HTML', 'Both')) {
         $htmlFile = Join-Path $ReportPath ("VBR_CyberSecure_Audit_{0}_{1}.html" -f $env:COMPUTERNAME, $timestamp)
         try {
@@ -1033,37 +1201,12 @@ function Export-ComplianceReport {
             $fail = @($script:Results | Where-Object Status -eq 'Failed').Count
             $warn = @($script:Results | Where-Object Status -eq 'Warning').Count
             $err  = @($script:Results | Where-Object Status -eq 'Error').Count
-            $total = $script:Results.Count
-            $score = if ($total) { [math]::Round(($pass / $total) * 100, 1) } else { 0 }
+            $man  = @($script:Results | Where-Object Status -eq 'Manual').Count
+            $auto = $pass + $fail + $warn + $err
+            $score = if ($auto) { [math]::Round(($pass / $auto) * 100, 1) } else { 0 }
 
-            $css = @'
-<style>
- body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1f2933;background:#f5f7fa;}
- h1{color:#0b5394;margin-bottom:4px;} h2{color:#334e68;margin-top:28px;}
- .meta{color:#627d98;font-size:13px;margin-bottom:16px;}
- .cards{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0;}
- .card{padding:14px 20px;border-radius:8px;color:#fff;min-width:120px;box-shadow:0 1px 3px rgba(0,0,0,.15);}
- .card b{display:block;font-size:26px;}
- .c-pass{background:#2e8b57;} .c-fail{background:#c0392b;} .c-warn{background:#d68910;}
- .c-err{background:#8e44ad;} .c-score{background:#0b5394;}
- table{border-collapse:collapse;width:100%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1);}
- th{background:#334e68;color:#fff;text-align:left;padding:8px 10px;font-size:13px;}
- td{padding:7px 10px;border-bottom:1px solid #e4e7eb;font-size:13px;vertical-align:top;}
- tr:nth-child(even){background:#f8fafc;}
- .s-Passed{color:#2e8b57;font-weight:bold;} .s-Failed{color:#c0392b;font-weight:bold;}
- .s-Warning{color:#b9770e;font-weight:bold;} .s-Error{color:#8e44ad;font-weight:bold;}
- .s-Info{color:#0b5394;font-weight:bold;}
-</style>
-'@
-
-            # Load System.Web for HtmlEncode BEFORE using it. If unavailable (Server Core
-            # / .NET variations), fall back to a manual character-replacement encoder.
             $useWeb = $false
-            try {
-                Add-Type -AssemblyName System.Web -ErrorAction Stop
-                $useWeb = $true
-            } catch { $useWeb = $false }
-
+            try { Add-Type -AssemblyName System.Web -ErrorAction Stop; $useWeb = $true } catch { $useWeb = $false }
             function Convert-HtmlEncode {
                 param([string]$Text)
                 if ($null -eq $Text) { return '' }
@@ -1071,39 +1214,57 @@ function Export-ComplianceReport {
                 return $Text.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;')
             }
 
+            $css = @'
+<style>
+ body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1f2933;background:#f5f7fa;}
+ h1{color:#0b5394;margin-bottom:4px;} .meta{color:#627d98;font-size:13px;margin-bottom:16px;}
+ .cards{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0;}
+ .card{padding:14px 20px;border-radius:8px;color:#fff;min-width:96px;box-shadow:0 1px 3px rgba(0,0,0,.15);}
+ .card b{display:block;font-size:24px;}
+ .c-pass{background:#2e8b57;}.c-fail{background:#c0392b;}.c-warn{background:#d68910;}
+ .c-err{background:#8e44ad;}.c-man{background:#4a6572;}.c-score{background:#0b5394;}
+ table{border-collapse:collapse;width:100%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1);}
+ th{background:#334e68;color:#fff;text-align:left;padding:8px 10px;font-size:13px;position:sticky;top:0;}
+ td{padding:7px 10px;border-bottom:1px solid #e4e7eb;font-size:13px;vertical-align:top;}
+ tr:nth-child(even){background:#f8fafc;} td.num{white-space:nowrap;font-weight:bold;color:#334e68;}
+ .s-Passed{color:#2e8b57;font-weight:bold;}.s-Failed{color:#c0392b;font-weight:bold;}
+ .s-Warning{color:#b9770e;font-weight:bold;}.s-Error{color:#8e44ad;font-weight:bold;}
+ .s-Manual{color:#4a6572;font-weight:bold;}.s-Info{color:#0b5394;font-weight:bold;}
+</style>
+'@
             $rows = foreach ($r in $script:Results) {
-                $cvEnc = Convert-HtmlEncode $r.'Current Value'
-                $rnEnc = Convert-HtmlEncode $r.'Rule Name'
-                $rcEnc = Convert-HtmlEncode $r.Recommendation
-                "<tr><td>$($r.Topic)</td><td>$rnEnc</td><td class='s-$($r.Status)'>$($r.Status)</td><td>$cvEnc</td><td>$rcEnc</td></tr>"
+                $num = Convert-HtmlEncode $r.'Item #'
+                $rn  = Convert-HtmlEncode $r.'Rule Name'
+                $cv  = Convert-HtmlEncode $r.'Current Value'
+                $rc  = Convert-HtmlEncode $r.Recommendation
+                "<tr><td class='num'>$num</td><td>$($r.Topic)</td><td>$rn</td><td class='s-$($r.Status)'>$($r.Status)</td><td>$cv</td><td>$rc</td></tr>"
             }
 
             $html = @"
 <!DOCTYPE html><html><head><meta charset="utf-8"><title>VBR v13 Cyber Secure Audit</title>$css</head>
 <body>
 <h1>Veeam VBR v13 - VDP Cyber Secure Compliance Audit</h1>
-<div class="meta">Host: <b>$env:COMPUTERNAME</b> &nbsp;|&nbsp; VBR server: <b>$VBRServer</b> &nbsp;|&nbsp; Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</div>
+<div class="meta">Host: <b>$env:COMPUTERNAME</b> &nbsp;|&nbsp; VBR server: <b>$VBRServer</b> &nbsp;|&nbsp; Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') &nbsp;|&nbsp; Items: $($script:Results.Count)</div>
 <div class="cards">
- <div class="card c-score">Score<b>$score%</b></div>
+ <div class="card c-score">Auto Score<b>$score%</b></div>
  <div class="card c-pass">Passed<b>$pass</b></div>
  <div class="card c-fail">Failed<b>$fail</b></div>
  <div class="card c-warn">Warning<b>$warn</b></div>
  <div class="card c-err">Error<b>$err</b></div>
+ <div class="card c-man">Manual<b>$man</b></div>
 </div>
 <table>
-<thead><tr><th>Topic</th><th>Rule Name</th><th>Status</th><th>Current Value</th><th>Recommendation</th></tr></thead>
+<thead><tr><th>Item #</th><th>Topic</th><th>Rule Name</th><th>Status</th><th>Current Value</th><th>Recommendation</th></tr></thead>
 <tbody>
 $($rows -join "`n")
 </tbody></table>
-<p class="meta">Report reflects automated checks only. Items marked Warning/Error require manual verification against the VDP v13 Cyber Secure Checklist.</p>
+<p class="meta">Auto Score = Passed / (Passed+Failed+Warning+Error), excluding Manual items. Warning/Error/Manual rows require human verification against the VDP v13 Cyber Secure Checklist.</p>
 </body></html>
 "@
             $html | Out-File -FilePath $htmlFile -Encoding UTF8
-            Write-Host ("[+] HTML report written: {0}" -f $htmlFile) -ForegroundColor Green
+            Write-Host ("[+] HTML report: {0}" -f $htmlFile) -ForegroundColor Green
         }
-        catch {
-            Write-Warning ("Failed to write HTML report: {0}" -f $_.Exception.Message)
-        }
+        catch { Write-Warning ("Failed to write HTML: {0}" -f $_.Exception.Message) }
     }
 }
 
@@ -1114,35 +1275,35 @@ $($rows -join "`n")
 try {
     Invoke-ComponentChecks
     Invoke-WindowsBuildChecks
+    Invoke-VsaBuildChecks
     Invoke-RepositoryChecks
     Invoke-AccountChecks
     Invoke-EncryptionChecks
+    Invoke-OperationalChecks
+    Invoke-NasChecks
+    Invoke-DrChecks
     Invoke-DetectionChecks
 }
 finally {
-    # Always disconnect the VBR session we opened, then emit reports and summary.
-    if ($script:VbrConnected) {
-        try {
-            if (Test-VeeamCmdlet -Name 'Disconnect-VBRServer') {
-                Disconnect-VBRServer -ErrorAction SilentlyContinue
-            }
-        } catch { }
+    if ($script:VbrConnected -and (Test-VeeamCmdlet -Name 'Disconnect-VBRServer')) {
+        try { Disconnect-VBRServer -ErrorAction SilentlyContinue } catch { }
     }
 
     Export-ComplianceReport
 
-    # Console summary tally.
     $pass = @($script:Results | Where-Object Status -eq 'Passed').Count
     $fail = @($script:Results | Where-Object Status -eq 'Failed').Count
     $warn = @($script:Results | Where-Object Status -eq 'Warning').Count
     $err  = @($script:Results | Where-Object Status -eq 'Error').Count
+    $man  = @($script:Results | Where-Object Status -eq 'Manual').Count
 
     Write-Host "`n===============================================================" -ForegroundColor Cyan
-    Write-Host '  Audit summary' -ForegroundColor Cyan
+    Write-Host ('  Audit summary - {0} checklist items' -f $script:Results.Count) -ForegroundColor Cyan
     Write-Host ('  Passed : {0}' -f $pass) -ForegroundColor Green
     Write-Host ('  Failed : {0}' -f $fail) -ForegroundColor Red
     Write-Host ('  Warning: {0}' -f $warn) -ForegroundColor Yellow
     Write-Host ('  Error  : {0}' -f $err)  -ForegroundColor Magenta
+    Write-Host ('  Manual : {0}' -f $man)  -ForegroundColor DarkCyan
     Write-Host '===============================================================' -ForegroundColor Cyan
 }
 
